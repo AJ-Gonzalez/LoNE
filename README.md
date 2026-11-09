@@ -160,3 +160,9 @@ the paired instrumented window (LUT6 22.3 tok/s, LUT4 23.6, fp16 8.5). Per-layer
 0.9973 (conv) / 0.9981 (attention) but compounds to 0.9526 over 24 layers; LUT4 is 0.896 / 0.935.
 LUT6 therefore needs QAT or a calibration pass to ship, but it is the useful middle ground for
 memory/speed experiments. LFM2.5-230M LUT6 measures 0.99506.
+
+Those power figures are **1–2.5 s window averages on the engine rail**, not sustained or
+whole-machine. A 60 s sustained LUT6 run measured **23.7 tok/s** with the ANE rail averaging
+**1.04 W (43.9 mJ/token)** and no throttling (10 s bins: 22.6 → 25.2 tok/s). The CPU and DRAM
+added ~1.7 W and ~0.9 W of dynamic power, so whole-system LUT6 decode is ~3.7 W dynamic
+(~155 mJ/token).
