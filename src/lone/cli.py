@@ -113,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--prefill", type=int, default=64)
     c.add_argument("--layers-per-model", type=int, default=1,
                    help="decoder layers per Core ML graph; 1 is the most accurate on ANE")
-    c.add_argument("--precision", choices=["fp16", "lut6"], default="fp16")
+    c.add_argument("--precision", choices=["fp16", "lut4", "lut6"], default="fp16")
     c.add_argument("--head-chunks", type=int, default=8)
     c.add_argument("--decode-only", action="store_true", help="skip the prefill models (slower prompts)")
     c.add_argument("--prefill-only", action="store_true", help="skip the decode models (prefill timing only)")

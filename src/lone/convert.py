@@ -109,10 +109,12 @@ def _trace_and_convert(module, input_names: list[str], output_names: list[str], 
         minimum_deployment_target=ct.target.macOS15,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
     )
-    if precision == "lut6":
-        from coremltools.optimize.coreml import OpPalettizerConfig, palettize_weights
+    bits = {"lut4": 4, "lut6": 6}.get(precision)
+    if bits is not None:
+        from coremltools.optimize.coreml import OptimizationConfig, OpPalettizerConfig, palettize_weights
 
-        mlmodel = palettize_weights(mlmodel, OpPalettizerConfig(nbits=6, mode="kmeans"))
+        config = OptimizationConfig(global_config=OpPalettizerConfig(nbits=bits, mode="kmeans"))
+        mlmodel = palettize_weights(mlmodel, config)
     elif precision != "fp16":
         raise ValueError(f"unknown precision {precision!r}")
 

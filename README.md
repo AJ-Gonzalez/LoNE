@@ -145,6 +145,13 @@ quantization-controlled comparison. LFM3 ANE decode varies **2–13 tok/s** with
 rate and power from the same run. Core ML `CPU_AND_GPU` (fp16) is not a real GPU path: 0.51 tok/s
 with 0.07 W on the GPU channel; the planner declines it.
 
+**4-bit (LUT4) on the ANE:** yes. `--precision lut4` palettizes the weights and the whole stack
+stays NE (56/104 ops per chunk), 4x smaller (1.4 GB bundle for LFM3). It decodes at **30.7 tok/s**
+(`lone run`) with **0.88 W** on the ANE channel (~37 mJ/token). Accuracy is the blocker:
+post-training kmeans at 4 bits measures 0.90 (conv) / 0.93 (attention) per-layer cosine,
+end-to-end logits **0.786**, argmax mismatch, and greedy diverges at token 0. Not usable without
+quantization-aware training or a better scheme. LUT6 parity is still unmeasured.
+
 ## Limits
 
 - **Static shapes.** Context and prefill length are frozen at conversion; unused context is masked.
