@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 
 import jinja2
 import numpy as np
@@ -103,6 +104,40 @@ class BundleTokenizer:
         return self.encode(text)
 
 
+_LIBMLOCK = None
+
+
+def _libmlock():
+    global _LIBMLOCK
+    if _LIBMLOCK is None:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.dylib", use_errno=True)
+        libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        libc.mlock.restype = ctypes.c_int
+        _LIBMLOCK = libc
+    return _LIBMLOCK
+
+
+def _wire_pages(arr: np.ndarray) -> tuple[int, int] | None:
+    """Wire an array's pages with `mlock(2)` so the kernel cannot page them out.
+
+    Returns the (page-aligned address, byte length) span on success, None when the platform or
+    the process refuses. macOS releases wired pages when the mapping is freed, so no explicit
+    unwire is needed at process exit.
+    """
+    if sys.platform != "darwin":
+        return None
+    import ctypes
+
+    page = os.sysconf("SC_PAGE_SIZE")
+    start = arr.ctypes.data & ~(page - 1)
+    end = (arr.ctypes.data + arr.nbytes + page - 1) & ~(page - 1)
+    if _libmlock().mlock(ctypes.c_void_p(start), ctypes.c_size_t(end - start)) != 0:
+        return None
+    return start, end - start
+
+
 def _inv_freq(spec: ModelSpec, kind: str) -> np.ndarray:
     rope = spec.rope_for(kind)
     hd = spec.head_dim
@@ -115,7 +150,7 @@ def _inv_freq(spec: ModelSpec, kind: str) -> np.ndarray:
 
 
 class LoneModel:
-    def __init__(self, bundle_dir: str, compute_units: str = "cpu_and_ne"):
+    def __init__(self, bundle_dir: str, compute_units: str = "cpu_and_ne", wire_caches: bool = False):
         import coremltools as ct
 
         self.dir = bundle_dir
@@ -148,6 +183,9 @@ class LoneModel:
 
         self._inv = {kind: _inv_freq(self.spec, kind) for kind in self.spec.rope}
         self._cache_dtype = np.float16
+        self._wire_caches = bool(wire_caches)
+        self.wired_bytes = 0
+        self._wired: list[tuple[int, int]] = []
         self.reset()
 
     # ------------------------------------------------------------------ state
@@ -155,19 +193,37 @@ class LoneModel:
     def tokenizer(self) -> BundleTokenizer:
         return self._tok
 
+    def _cache_arrays(self):
+        yield from self._k.values()
+        yield from self._v.values()
+        yield from self._conv.values()
+
     def reset(self) -> None:
+        """Zero the caches. Buffers are allocated once, then reused: at large `ctx` a
+        reallocation would briefly hold two full caches, and wired pages must keep their address.
+        """
         self.pos = 0
-        self._k = {
-            i: np.zeros((1, self.spec.num_kv_heads, self.ctx, self.spec.head_dim), dtype=self._cache_dtype)
-            for i in range(self.spec.num_layers)
-            if self.spec.is_attention(i)
-        }
-        self._v = {i: np.zeros_like(a) for i, a in self._k.items()}
-        self._conv = {
-            i: np.zeros((1, self.spec.hidden_size, self.spec.conv_kernel - 1), dtype=self._cache_dtype)
-            for i in range(self.spec.num_layers)
-            if not self.spec.is_attention(i)
-        }
+        allocating = not hasattr(self, "_k")
+        if allocating:
+            self._k = {
+                i: np.zeros((1, self.spec.num_kv_heads, self.ctx, self.spec.head_dim), dtype=self._cache_dtype)
+                for i in range(self.spec.num_layers)
+                if self.spec.is_attention(i)
+            }
+            self._v = {i: np.zeros_like(a) for i, a in self._k.items()}
+            self._conv = {
+                i: np.zeros((1, self.spec.hidden_size, self.spec.conv_kernel - 1), dtype=self._cache_dtype)
+                for i in range(self.spec.num_layers)
+                if not self.spec.is_attention(i)
+            }
+        for arr in self._cache_arrays():
+            arr.fill(0)
+        if allocating and self._wire_caches:
+            for arr in self._cache_arrays():
+                span = _wire_pages(arr)
+                if span is not None:
+                    self._wired.append(span)
+                    self.wired_bytes += span[1]
 
     # ------------------------------------------------------------------- math
     def _cos_sin(self, kind: str, positions: np.ndarray):
@@ -206,7 +262,9 @@ class LoneModel:
             self._k[i][0, :, pos : pos + seq, :] = out[f"k_{i}_out"][0].astype(np.float16)
             self._v[i][0, :, pos : pos + seq, :] = out[f"v_{i}_out"][0].astype(np.float16)
         for i in layout["conv_layers"]:
-            self._conv[i] = out[f"conv_{i}_out"].astype(np.float16)
+            # In place: the conv window keeps its address, so it stays wired and does not
+            # allocate once per token.
+            self._conv[i][...] = out[f"conv_{i}_out"]
         self._hidden = out["hidden_out"].astype(np.float16)
 
     def _forward(self, ids: list[int], tag: str, capture: list | None = None) -> None:

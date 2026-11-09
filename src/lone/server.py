@@ -25,11 +25,11 @@ def _server_time() -> int:
     return int(time.time())
 
 
-def create_app(bundle_dir: str, compute_units: str = "cpu_and_ne"):
+def create_app(bundle_dir: str, compute_units: str = "cpu_and_ne", wire_caches: bool = False):
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse, StreamingResponse
 
-    model = LoneModel(bundle_dir, compute_units)
+    model = LoneModel(bundle_dir, compute_units, wire_caches=wire_caches)
     model_name = os.path.basename(os.path.abspath(bundle_dir))
     lock = asyncio.Lock()
     counters = ANECounters()
@@ -43,6 +43,7 @@ def create_app(bundle_dir: str, compute_units: str = "cpu_and_ne"):
         "last": None,
     }
     app = FastAPI(title="LoNE", version="0.0.1")
+    app.state.wired_bytes = model.wired_bytes
 
     def _params(body: dict) -> dict:
         return {

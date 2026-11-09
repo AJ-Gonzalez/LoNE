@@ -26,6 +26,13 @@ def _units(cpu_only: bool, compute_units: ComputeUnits) -> str:
     return "cpu_only" if cpu_only else compute_units.value
 
 
+def _report_wired(wired_bytes: int) -> None:
+    if wired_bytes:
+        print(f"wired {wired_bytes / 2**20:.0f} MiB of caches", file=sys.stderr)
+    else:
+        print("cache wiring unavailable (needs macOS mlock); continuing unwired", file=sys.stderr)
+
+
 @app.command(help="convert an HF checkpoint into a LoNE bundle")
 def convert(
     model: str = typer.Option(..., "--model", help="HF checkpoint directory"),
@@ -73,10 +80,15 @@ def run(
     stream: bool = typer.Option(False, "--stream"),
     cpu_only: bool = typer.Option(False, "--cpu-only"),
     compute_units: ComputeUnits = typer.Option(ComputeUnits.cpu_and_ne, "--compute-units"),
+    wire_caches: bool = typer.Option(
+        False, "--wire-caches", help="wire the KV cache with mlock so it cannot be paged out (macOS)"
+    ),
 ) -> None:
     from .runtime import LoneModel
 
-    model = LoneModel(bundle, _units(cpu_only, compute_units))
+    model = LoneModel(bundle, _units(cpu_only, compute_units), wire_caches=wire_caches)
+    if wire_caches:
+        _report_wired(model.wired_bytes)
     if chat:
         messages = ([{"role": "system", "content": system}] if system else []) + [
             {"role": "user", "content": prompt}
@@ -127,12 +139,18 @@ def serve(
     port: int = typer.Option(8082, "--port"),
     cpu_only: bool = typer.Option(False, "--cpu-only"),
     compute_units: ComputeUnits = typer.Option(ComputeUnits.cpu_and_ne, "--compute-units"),
+    wire_caches: bool = typer.Option(
+        False, "--wire-caches", help="wire the KV cache with mlock so it cannot be paged out (macOS)"
+    ),
 ) -> None:
     import uvicorn
 
     from .server import create_app
 
-    uvicorn.run(create_app(bundle, _units(cpu_only, compute_units)), host=host, port=port, log_level="info")
+    app = create_app(bundle, _units(cpu_only, compute_units), wire_caches=wire_caches)
+    if wire_caches:
+        _report_wired(app.state.wired_bytes)
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 @app.command("inspect", help="print a bundle's spec and placement")

@@ -150,9 +150,13 @@ figure needs `powermetrics` (root) or a meter; PMP is per-rail.
 ## Limits
 
 - **Static shapes.** `ctx` and prefill length are frozen at conversion; unused context is masked.
-  Prompt remainders are decoded one token at a time. Context memory is 22.5 KB/token for LFM3
-  (0.7 GB at 32k, 1.4 GB at 64k, 2.9 GB at 128k); 32k is comfortable on 8 GB and 128k is
-  swap-bound `[INFERENCE]` (no long-context run beyond 256 tokens yet).
+  Prompt remainders are decoded one token at a time. The KV and conv caches are allocated for the
+  full `ctx` at load, so the cost is paid even by a short prompt. Context memory is 22.5 KB/token
+  for LFM3 (0.7 GB at 32k, 1.4 GB at 64k, 2.9 GB at 128k); 32k is comfortable on 8 GB and 128k is
+  swap-bound `[INFERENCE]` (no long-context run beyond 256 tokens yet). `--wire-caches` on `run` or
+  `serve` pins the caches with `mlock(2)` (macOS, off by default) so memory pressure evicts the
+  mmap-backed weights instead; it wires the whole cache, e.g. 192 MiB at `ctx 16384` on
+  LFM2.5-230M.
 - **fp16 / palettized only.** No fp32 ANE path; palettized weights trade accuracy (see above).
 - **One request, no batching**; no left-padded prompts.
 - **Embedding gather is CPU**; the LM head runs on the ANE in vocabulary slices.
