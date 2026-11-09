@@ -224,3 +224,6 @@ bundles/
 *.mlpackage
 *.mlmodelc
 models/
+
+# release staging (kept outside the repo; guard against creating one here)
+pending/
