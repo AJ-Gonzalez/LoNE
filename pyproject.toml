@@ -8,6 +8,19 @@ version = "0.0.1"
 description = "LFM3 / LFM2.5 on the Apple Neural Engine"
 readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "AJ-Gonzalez", email = "aj.gonzalez.dev@gmail.com" }]
+keywords = ["coreml", "apple-neural-engine", "ane", "lfm3", "liquid-ai", "llm-inference", "quantization"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
@@ -24,6 +37,11 @@ dependencies = [
 convert = ["torch==2.7.0", "scikit-learn>=1.4,<1.6"]
 chat = ["transformers>=5.0"]
 test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/AJ-Gonzalez/LoNE"
+Repository = "https://github.com/AJ-Gonzalez/LoNE"
+Issues = "https://github.com/AJ-Gonzalez/LoNE/issues"
 
 [project.scripts]
 lone = "lone.cli:main"

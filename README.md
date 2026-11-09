@@ -9,9 +9,11 @@ arithmetic failures, which are the precision rules below.
 Apple Silicon, macOS 14+, Python 3.11+.
 
 ```bash
-uv venv && source .venv/bin/activate
-uv pip install -e '.[convert,chat]'
+pip install lone-ane                  # run / serve
+pip install 'lone-ane[convert,chat]'  # conversion + HF chat templates
 ```
+
+For a development checkout: `uv venv && source .venv/bin/activate && uv pip install -e '.[convert,chat]'`.
 
 `convert` adds torch 2.7.0 and scikit-learn (coremltools' k-means palettizer); `chat` adds
 transformers for exact chat-template rendering (otherwise the bundled Jinja template is used).
@@ -94,9 +96,9 @@ without root; rates and power are from the same window.
 | CPU (`CPU_ONLY`) | fp16, 4.0 GB | 2.73 (32 tok) | 0.20 | 0.45 W | 1.64 W | 8.2 |
 | GPU (MLX 4-bit, Metal) | 4-bit, 0.95 GB | 385.9 (512 tok) | 53.3 | 9.12 W | 6.04 W | 0.113 |
 
-![LFM3 throughput: prefill and decode](docs/tokens.svg)
+![LFM3 throughput: prefill and decode](https://raw.githubusercontent.com/AJ-Gonzalez/LoNE/main/docs/tokens.svg)
 
-![Engine power during decode and prefill](docs/power.svg)
+![Engine power during decode and prefill](https://raw.githubusercontent.com/AJ-Gonzalez/LoNE/main/docs/power.svg)
 
 These are engine numbers, not wall power. During decode the ANE path's CPU orchestration adds
 ~1.7 W and DRAM ~0.9 W; the CPU row's work power is 2.82 W (1.64 W above idle). The GPU row is
