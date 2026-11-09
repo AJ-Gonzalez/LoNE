@@ -1,78 +1,44 @@
 # LoNE: Liquid on Neural Engine
 
-LFM3 and LFM2.5 on the Apple Neural Engine, via Core ML.
-
-Core ML is an energy play, not a speed play: decode is bandwidth-bound on the ANE, so expect
-MLX-class throughput at a much lower power envelope.
-
-LoNE splits and rescales wide reductions because the ANE loses precision on them; the measured
-numbers and the failure modes are below.
-
-## Conversion precision rules
-
-The ANE's arithmetic differs from torch's fp16 in four measurable ways. `torch_model` implements
-all four; `lone verify` exists because per-op conversion parity does **not** catch three of them.
-
-| Rule | Why |
-|---|---|
-| **1 layer per Core ML graph** | 1 → 0.99986 logits cosine, 2 → 0.9968, 4 → 0.9969 on LFM2.5-230M |
-| **Wide reductions split** (FFN > 4096, LM head hidden > 1024) | one 6656-wide output projection measured 0.9972 cosine; two 3328-wide ones 0.999994 |
-| **Wide reductions scaled by 2^4** (any `k > 1024`; weights ×16, output ×1/16) | the ANE's linear core loses precision when products fall subnormal: LFM3's conv `out_proj` (input absmax 0.066 × weights ~0.02) measured 0.99916 cosine, 0.9999998 after the rescale. Exact in real arithmetic, and no extra I/O |
-| **SiLU via `x / (1 + exp(-x))`** | Core ML's fused `silu` (and `x * sigmoid(x)`) is an NE approximation ~1e-3 off; the exp form is exact. FFN gate 0.99935 → 0.999991 on real LFM3 activations |
-
-Scaling a power of two is exact in fp16 unless it overflows; 2^4 keeps every measured accumulator
-two orders of magnitude below the fp16 maximum. The norm reductions do not need any of this:
-`mean` over 2048 measured exact on the ANE.
-
-
-## Requirements
-
-- Apple Silicon, macOS 14+ (measured on M1, 8 GB, macOS 26.6)
-- Python 3.11+
-- Conversion: `torch==2.7.0` (the version coremltools 9.0 tests against) and `scikit-learn`
-  (coremltools' k-means palettizer needs it for `lut4`/`lut6`)
+LFM3 and LFM2.5 on the Apple Neural Engine, via Core ML. Decode is bandwidth-bound on the ANE, so
+LoNE targets MLX-class throughput at a lower power envelope; it also works around the ANE's fp16
+arithmetic failures, which are the precision rules below.
 
 ## Install
+
+Apple Silicon, macOS 14+, Python 3.11+.
 
 ```bash
 uv venv && source .venv/bin/activate
 uv pip install -e '.[convert,chat]'
 ```
 
-`chat` adds `transformers` for exact chat-template rendering; without it LoNE renders
-`chat_template.jinja` itself.
+`convert` adds torch 2.7.0 and scikit-learn (coremltools' k-means palettizer); `chat` adds
+transformers for exact chat-template rendering (otherwise the bundled Jinja template is used).
 
-## Convert
+## Quick start
 
 ```bash
 lone convert --model /path/to/LFM3-1.7B --out bundles/lfm3-1.7b --ctx 2048 --prefill 64
-```
-
-Each run prints the `MLComputePlan` placement per model and writes `manifest.json`. Useful flags:
-
-| Flag | Default | Effect |
-|---|---|---|
-| `--precision` | `fp16` | `lut6` palettizes weights (≈2.6× smaller, placement untested) |
-| `--layers-per-model` | `1` | decoder layers per Core ML graph; 1 is the most accurate (see below) |
-| `--head-chunks` | `8` | LM-head vocabulary slices, one ANE model each |
-| `--decode-only` | off | skip prefill models; prompts run token by token |
-| `--no-plan` | off | skip the placement report (faster conversion) |
-
-Weights are stored once per sequence shape (prefill + decode), so a bundle is roughly 2× the fp16
-checkpoint size. `--decode-only` halves that.
-
-## Run
-
-```bash
 lone run --bundle bundles/lfm3-1.7b --chat --prompt "Explain RoPE in two sentences" --max-new-tokens 128
+lone serve --bundle bundles/lfm3-1.7b --port 8082
 lone inspect --bundle bundles/lfm3-1.7b
+lone verify --bundle bundles/lfm3-1.7b --model /path/to/LFM3-1.7B \
+    --prompt "Explain in one sentence why the sky is blue."
 ```
+
+Convert flags: `--precision fp16|lut4|lut6`, `--layers-per-model 1`, `--head-chunks 8`,
+`--decode-only`/`--prefill-only`, `--no-plan`. Weights are stored once per sequence shape, so a
+full bundle is ~2x the fp16 checkpoint; `--decode-only` halves it.
+
+`lone verify` runs the HF checkpoint in a subprocess, then the bundle's decode path in the parent;
+it prints logits cosine, argmax, the per-layer hidden drift and (with `--max-new-tokens`) the first
+greedy divergence. It exits 1 below `--min-cos` (default 0.999). Run it before trusting a
+conversion.
 
 ## Serve
 
 ```bash
-lone serve --bundle bundles/lfm3-1.7b --port 8082
-
 curl -s localhost:8082/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "lfm3-1.7b",
   "messages": [{"role": "user", "content": "Hi"}],
@@ -85,48 +51,42 @@ curl -s localhost:8082/v1/chat/completions -H 'Content-Type: application/json' -
 | `POST /v1/chat/completions` | OpenAI chat schema, SSE when `stream: true` |
 | `POST /v1/completions` | raw prompt, SSE when `stream: true` |
 | `GET /v1/models`, `/health` | harness probes |
-| `GET /metrics` | requests, prefill/decode tokens/s and seconds, last-request ANE bytes (IOReport; streamed requests included) |
+| `GET /metrics` | prefill/decode seconds and rates, last-request ANE bytes (IOReport; streams included) |
 
-Point EvalPlus (`--backend openai --base-url http://127.0.0.1:8082/v1`), lm-eval
-(`local-chat-completions`) or Harbor (`--api-format openai_chat_completions`) at it. One request is
-processed at a time; Core ML serialises predictions anyway.
+One request at a time; Core ML serialises predictions anyway. `--cpu-only` and
+`--compute-units {cpu_and_ne,cpu_and_gpu,cpu_only,all}` select the engine. Point EvalPlus
+(`--backend openai`), lm-eval (`local-chat-completions`) or Harbor at the OpenAI endpoint.
 
-## Measured (pre-release, M1 8 GB)
+## Precision rules
 
-ANE residency and cost of the LFM3-1.7B layers (fp16, real weights, `MLComputePlan` + IOReport
-`ANE RD/WR`):
+The ANE's arithmetic differs from torch's fp16 in four measurable ways; `torch_model` implements
+all four and `lone verify` exists because per-op conversion parity does not catch them.
 
-| Unit | NE ops | p50 | ANE MB/pass |
-|---|---:|---:|---:|
-| 13 conv layers, one graph | 546/546 | 29.97 ms | 1,665 |
-| 6 full-attention layers, one graph | 506/506 | 17.26 ms | 694 |
-| per token (13 conv + 11 attention layers) | — | 61.6 ms | 2,943 |
+| Rule | Why (measured) |
+|---|---|
+| **1 layer per graph** | 1 layer → 0.99986 logits cosine; 2 → 0.9968; 4 → 0.9969 on 230M |
+| **Wide reductions split** (FFN > 4096, head hidden > 1024) | one 6656-wide projection 0.9972; two 3328-wide 0.999994 |
+| **Wide reductions scaled by 2^4** (any k > 1024; weights ×16, output ×1/16) | products otherwise fall subnormal: LFM3 conv `out_proj` 0.99916 → 0.9999998 |
+| **SiLU as `x / (1 + exp(-x))`** | Core ML's fused `silu`/`sigmoid` is an NE approximation ~1e-3 off; gate 0.99935 → 0.999991 |
 
-That per-layer sum is **16.2 tok/s at fp16**. The shipped bundle decodes at **13.2 tok/s** in a
-warm process (75.8 ms/token; 24 chunks x ~2.9 ms, the precision ops add ~14 ms/token over the
-spike), and **~2 tok/s when the 3.9 GB of weights are evicted** and stream from SSD (measured
-1.55 GB/s ceiling, NOTES §10). Weight traffic matches the fp16 layer weights to 0.4%, i.e. every
-token re-reads every weight, so residency is what decides throughput. A LUT6 bundle projects to
-~1.10 GB/token and **~46 tok/s** `[INFERENCE]`, small enough to stay resident — MLX-4bit parity
-(47.6 tok/s) at lower power.
+Power-of-two scaling is exact in fp16 unless it overflows; 2^4 stays far below the fp16 maximum.
+Norm reductions need none of this — `mean` over 2048 measured exact on the ANE.
 
-LFM2.5-230M end-to-end (ctx 128, 1 layer per graph): logits cosine **0.99987** vs the HF fp16
-model; 50.7 tok/s decode over 32 tokens, 138 ms to the first token. **Placement is CPU** on this
-machine: the M1 planner declines the 14-layer graph (§12.3), so this is a CPU-path result, not ANE.
+## Measured (M1, 8 GB)
 
-LFM2.5-350M end-to-end: logits cosine **0.99989**, greedy output identical to HF for 12 tokens
-(FFN split into two wide reductions). Chat, streaming and `/metrics` were verified through the
-HTTP server. **Placement is CPU** for the same reason; its ANE byte counters read zero.
+Parity (`lone verify`, decode path):
 
-Chunk size is a precision knob on the ANE, not just a call-count knob: 1 layer per graph gives
-0.99986 logits cosine, 2 layers 0.9968, 4 layers 0.9969 on the same prompt. Keep
-`--layers-per-model 1` unless you have re-measured the tradeoff.
+| Model | Placement | Logits cosine | Notes |
+|---|---|---:|---|
+| LFM2.5-230M (ctx 128) | CPU | 0.99987 | greedy 2 tokens identical, then EOS differs |
+| LFM2.5-350M (ctx 128) | CPU | 0.99989 | greedy 12/12 identical |
+| LFM3-1.7B (ctx 256) | NE | **0.99977** | hidden min 0.99958; greedy diverges at token 6/12 |
 
-## Engines: speed and power (LFM3-1.7B)
+Placement is `MLComputePlan` over every chunk. The M1 planner declines the small LFM2.5 graphs, so
+only LFM3 runs on the NE here; the LFM2.5 rows are CPU-path parity results.
 
-Three execution paths for the same model: Core ML fp16 on the ANE, Core ML fp16 on the CPU, and
-MLX 4-bit on the Metal GPU (the only GPU path in this repo). Power is the engine's PMP energy
-channel over the measured window, idle-subtracted and read through IOReport without root.
+LFM3 speeds and power by engine. Power is the engine's PMP rail, idle-subtracted, via IOReport
+without root; rates and power are from the same window.
 
 | Engine | Weights | Prefill tok/s | Decode tok/s | Prefill power | Decode power | J/token (decode) |
 |---|---|---:|---:|---:|---:|---:|
@@ -138,31 +98,50 @@ channel over the measured window, idle-subtracted and read through IOReport with
 
 ![Engine power during decode and prefill](docs/power.svg)
 
-Read these as engine numbers, not wall power: the ANE path's CPU orchestration adds ~1.7 W and
-DRAM ~0.9 W during decode, and the CPU row's total work power is 2.82 W (1.64 W above idle). The
-GPU row is 4-bit, the only Metal path here, while the ANE/CPU rows are fp16 — this is not a
-quantization-controlled comparison. LFM3 ANE decode varies **2–13 tok/s** with weight residency
-(one instrumented run measured 8.5 tok/s at 0.59 W; `lone run` warm measured 13.2 tok/s), so pair
-rate and power from the same run. Core ML `CPU_AND_GPU` (fp16) is not a real GPU path: 0.51 tok/s
-with 0.07 W on the GPU channel; the planner declines it.
+These are engine numbers, not wall power. During decode the ANE path's CPU orchestration adds
+~1.7 W and DRAM ~0.9 W; the CPU row's work power is 2.82 W (1.64 W above idle). The GPU row is
+4-bit while ANE/CPU are fp16, so it is not a quantization-controlled comparison. LFM3 ANE decode
+varies **2–13 tok/s** with weight residency (8.5 tok/s in the instrumented window, 13.2 tok/s with
+`lone run` warm, ~2 tok/s when the 4 GB stream from SSD), so pair rate and power from one run.
+`CPU_AND_GPU` is not a real GPU path: 0.51 tok/s with 0.07 W on the GPU channel.
 
-**Quantized ANE (LFM3-1.7B):** both palettized formats run fully on the NE. LUT6 is the better
-trade; neither meets the 0.999 parity bar.
+Quantized ANE (LFM3-1.7B) — both run fully on the NE, neither meets the parity bar:
 
-| ANE weights | Bundle | Decode | ANE power | Energy/token | Logits cosine |
+| Weights | Bundle | Decode | ANE power | Energy/token | Logits cosine |
 |---|---:|---:|---:|---:|---:|
 | fp16 | 4.0 GB | 13.2 tok/s | 0.59 W | 0.070 J | 0.99977 |
 | LUT6 | 1.8 GB | 20.5 tok/s | 0.87 W | 0.039 J | 0.9526 |
 | LUT4 | 1.4 GB | 30.7 tok/s | 0.88 W | 0.037 J | 0.786 |
 
-Decode rates are `lone run`; power is the ANE PMP channel (idle-subtracted) and energy/token uses
-the paired instrumented window (LUT6 22.3 tok/s, LUT4 23.6, fp16 8.5). Per-layer LUT6 accuracy is
-0.9973 (conv) / 0.9981 (attention) but compounds to 0.9526 over 24 layers; LUT4 is 0.896 / 0.935.
-LUT6 therefore needs QAT or a calibration pass to ship, but it is the useful middle ground for
-memory/speed experiments. LFM2.5-230M LUT6 measures 0.99506.
+Rates are `lone run`; energy uses the paired instrumented window (LUT6 22.3, LUT4 23.6, fp16 8.5
+tok/s). LUT6 per-layer accuracy is 0.9973 (conv) / 0.9981 (attention) but compounds to 0.9526 over
+24 layers; LUT4 is 0.896 / 0.935. Palettized LFM3 needs QAT to ship; LUT6 is the useful
+memory/speed middle ground.
 
-Those power figures are **1–2.5 s window averages on the engine rail**, not sustained or
-whole-machine. A 60 s sustained LUT6 run measured **23.7 tok/s** with the ANE rail averaging
-**1.04 W (43.9 mJ/token)** and no throttling (10 s bins: 22.6 → 25.2 tok/s). The CPU and DRAM
-added ~1.7 W and ~0.9 W of dynamic power, so whole-system LUT6 decode is ~3.7 W dynamic
-(~155 mJ/token).
+Those power figures are **1–2.5 s window averages**. A 60 s sustained LUT6 run measured 23.7 tok/s
+with the ANE rail at 1.04 W (43.9 mJ/token) and no throttling (10 s bins: 22.6 → 25.2 tok/s).
+With CPU and DRAM, whole-system LUT6 decode is ~3.7 W dynamic (~155 mJ/token). A wall/package
+figure needs `powermetrics` (root) or a meter; PMP is per-rail.
+
+## Limits
+
+- **Static shapes.** `ctx` and prefill length are frozen at conversion; unused context is masked.
+  Prompt remainders are decoded one token at a time. Context memory is 22.5 KB/token for LFM3
+  (0.7 GB at 32k, 1.4 GB at 64k, 2.9 GB at 128k); 32k is comfortable on 8 GB and 128k is
+  swap-bound `[INFERENCE]` (no long-context run beyond 256 tokens yet).
+- **fp16 / palettized only.** No fp32 ANE path; palettized weights trade accuracy (see above).
+- **One request, no batching**; no left-padded prompts.
+- **Embedding gather is CPU**; the LM head runs on the ANE in vocabulary slices.
+- **Prefill models load lazily**, decode models at startup; a full bundle stores both shapes.
+- **Not implemented:** tools/structured output, `logit_bias`, `n`, `logprobs`; `stop` strings are
+  applied to the decoded text after generation. Sharded checkpoints are unsupported.
+- **Depth costs accuracy.** LFM3's hidden cosine falls 0.999995 → 0.99958 over 24 layers; greedy
+  output diverges from HF after 6 tokens despite the 0.99977 logits cosine.
+
+## How it works
+
+The stack is split into contiguous chunks, one `mlprogram` per sequence shape
+(prefill and decode). Caches are ordinary tensors owned by the runtime — K/V per attention layer
+and the `conv_kernel-1` window per conv layer — concatenated as `past || new` inside the graph with
+an additive mask keyed by absolute position. No Core ML state buffers, so the conversion path stays
+on TorchScript. The LM head is vocabulary slices on the ANE; the embedding gather runs on the CPU.
