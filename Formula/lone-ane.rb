@@ -12,7 +12,7 @@ class LoneAne < Formula
   depends_on :macos
 
   def install
-    venv = virtualenv_create(libexec, "python3.12")
+    venv = virtualenv_create(libexec, "python3.12", system_site_packages: false)
     python = Formula["python@3.12"].opt_bin/"python3.12"
     # The Homebrew helper installs --no-deps (resources are expected); this tap
     # resolves the runtime dependencies from PyPI instead.
