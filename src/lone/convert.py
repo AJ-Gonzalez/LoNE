@@ -1,0 +1,264 @@
+"""Convert an LFM checkpoint into a LoNE bundle of Core ML mlprograms.
+
+Bundle layout::
+
+    <out>/manifest.json
+    <out>/chunks/chunk_<i>_prefill.mlpackage   (seq = prefill)
+    <out>/chunks/chunk_<i>_decode.mlpackage    (seq = 1)
+    <out>/head/head_<j>.mlpackage              (final norm + vocab slice, seq = 1)
+    <out>/embedding.fp16.npy                   (token gather matrix)
+    <out>/tokenizer/...                        (tokenizer.json, chat template, ...)
+
+Chunks are contiguous decoder layers. Caches are ordinary tensors owned by the runtime, so no
+Core ML state buffers are involved and conversion stays on the TorchScript path.
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import math
+import os
+import shutil
+import time
+
+import numpy as np
+
+from . import MANIFEST_FORMAT, __version__
+from .config import ModelSpec
+from .layout import chunk_layout, split_layers
+
+TOKENIZER_FILES = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "chat_template.jinja",
+    "generation_config.json",
+)
+
+# HF parameter names -> the short keys the static modules use.
+_ATTN_KEYS = ("q_proj", "k_proj", "v_proj", "o_proj")
+
+
+def _short_name(hf_suffix: str, spec: ModelSpec) -> str | None:
+    """Map a tensor name below `model.layers.<i>.` to a short key, or None if unused."""
+    if hf_suffix.endswith(".weight"):
+        hf_suffix = hf_suffix[: -len(".weight")]
+    if hf_suffix.startswith("self_attn."):
+        name = hf_suffix.split(".", 1)[1]
+        if name == "out_proj":  # LFM2
+            return "o_proj"
+        if name in _ATTN_KEYS:
+            return name
+        if name in ("q_norm", "q_layernorm"):
+            return spec.qk_norm_prefix
+        if name in ("k_norm", "k_layernorm"):
+            return "k_norm" if spec.qk_norm_prefix == "q_norm" else "k_layernorm"
+        if name == "gate_proj":
+            return "gate_proj"
+        return None
+    if hf_suffix.startswith("conv."):
+        name = hf_suffix.split(".", 1)[1]
+        return name if name in ("conv", "in_proj", "out_proj") else None
+    if hf_suffix.startswith("feed_forward."):
+        name = hf_suffix.split(".", 1)[1]
+        return name if name in ("w1", "w2", "w3") else None
+    if hf_suffix in ("operator_norm", "ffn_norm", "post_operator_norm", "post_ffn_norm"):
+        return hf_suffix
+    return None
+
+
+def _read_layer(sd, spec: ModelSpec, layer: int, dtype) -> dict:
+    prefix = f"model.layers.{layer}."
+    params = {}
+    for key in sd.keys():
+        if not key.startswith(prefix) or not key.endswith(".weight"):
+            continue
+        short = _short_name(key[len(prefix) :], spec)
+        if short is not None:
+            params[short] = sd.get_tensor(key).to(dtype)
+    if spec.is_attention(layer):
+        need = {"q_proj", "k_proj", "v_proj", "o_proj", spec.qk_norm_prefix}
+        if spec.attention_gate:
+            need.add("gate_proj")
+    else:
+        need = {"conv", "in_proj", "out_proj"}
+    need |= {"operator_norm", "ffn_norm", "w1", "w2", "w3"}
+    if spec.sandwich_norm:
+        need |= {"post_operator_norm", "post_ffn_norm"}
+    missing = need - params.keys()
+    if missing:
+        raise KeyError(f"layer {layer} ({spec.kind(layer)}) is missing tensors: {sorted(missing)}")
+    return params
+
+
+def _trace_and_convert(module, input_names: list[str], output_names: list[str], example: dict, name: str,
+                       out_dir: str, precision: str):
+    import coremltools as ct
+    import torch
+
+    module.eval()
+    args = tuple(example[n] for n in input_names)
+    with torch.no_grad():
+        traced = torch.jit.trace(module, args, strict=False)
+    mlmodel = ct.convert(
+        traced,
+        inputs=[ct.TensorType(name=n, shape=tuple(example[n].shape), dtype=np.float16) for n in input_names],
+        outputs=[ct.TensorType(name=n, dtype=np.float16) for n in output_names],
+        convert_to="mlprogram",
+        minimum_deployment_target=ct.target.macOS15,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
+    )
+    if precision == "lut6":
+        from coremltools.optimize.coreml import OpPalettizerConfig, palettize_weights
+
+        mlmodel = palettize_weights(mlmodel, OpPalettizerConfig(nbits=6, mode="kmeans"))
+    elif precision != "fp16":
+        raise ValueError(f"unknown precision {precision!r}")
+
+    path = os.path.join(out_dir, f"{name}.mlpackage")
+    mlmodel.save(path)
+    return path
+
+
+def plan_summary(pkg_path: str, compute_units: str = "cpu_and_ne") -> dict:
+    """MLComputePlan placement for a saved mlpackage. Empty dict if the plan is unavailable."""
+    import coremltools as ct
+
+    units = {
+        "cpu_and_ne": ct.ComputeUnit.CPU_AND_NE,
+        "cpu_only": ct.ComputeUnit.CPU_ONLY,
+        "all": ct.ComputeUnit.ALL,
+    }[compute_units]
+    try:
+        model = ct.models.MLModel(pkg_path, compute_units=units)
+        plan = ct.models.compute_plan.MLComputePlan.load_from_path(model.get_compiled_model_path(), compute_units=units)
+    except Exception as exc:  # pragma: no cover - depends on the OS / model
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+    counts: dict[str, int] = {}
+
+    def walk(block):
+        for op in block.operations:
+            usage = plan.get_compute_device_usage_for_mlprogram_operation(op)
+            if usage is None:
+                continue
+            dev = str(usage.preferred_compute_device)
+            low = dev.lower()
+            key = "NE" if ("neural" in low or "ane" in low) else ("GPU" if "gpu" in low else ("CPU" if "cpu" in low else dev))
+            counts[key] = counts.get(key, 0) + 1
+            for inner in getattr(op, "blocks", []) or []:
+                walk(inner)
+
+    walk(plan.model_structure.program.functions["main"].block)
+    return {"devices": counts, "total": sum(counts.values())}
+
+
+def _copy_tokenizer(model_dir: str, out_dir: str) -> None:
+    dst = os.path.join(out_dir, "tokenizer")
+    os.makedirs(dst, exist_ok=True)
+    for name in TOKENIZER_FILES:
+        src = os.path.join(model_dir, name)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(dst, name))
+
+
+def convert_model(
+    model_dir: str,
+    out_dir: str,
+    ctx: int = 2048,
+    prefill: int = 64,
+    layers_per_model: int = 1,
+    precision: str = "fp16",
+    head_chunks: int = 8,
+    decode_only: bool = False,
+    check_plan: bool = True,
+    compute_units: str = "cpu_and_ne",
+    log=print,
+) -> dict:
+    import torch
+    from safetensors import safe_open
+
+    from .torch_model import Chunk, Head, example_inputs
+
+    started = time.time()
+    spec = ModelSpec.from_dir(model_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    chunk_dir = os.path.join(out_dir, "chunks")
+    head_dir = os.path.join(out_dir, "head")
+    os.makedirs(chunk_dir, exist_ok=True)
+    os.makedirs(head_dir, exist_ok=True)
+
+    ckpt = os.path.join(model_dir, "model.safetensors")
+    if not os.path.exists(ckpt):
+        raise FileNotFoundError(f"{ckpt} not found; LoNE v0.1 expects a single-file safetensors checkpoint")
+    log(f"{spec.model_type}: {spec.num_layers} layers, hidden {spec.hidden_size}, "
+        f"{len(spec.layer_ids('conv'))} conv / {len(spec.layer_ids('full_attention'))} full / "
+        f"{len(spec.layer_ids('sliding_attention'))} sliding, ctx {ctx}, prefill {prefill}")
+
+    groups = split_layers(spec.num_layers, layers_per_model)
+    chunks_meta = []
+    with safe_open(ckpt, framework="pt") as sd:
+        for gi, layer_ids in enumerate(groups):
+            layout = chunk_layout(spec, layer_ids)
+            params = {i: _read_layer(sd, spec, i, torch.float16) for i in layer_ids}
+            entries = {"name": f"chunk_{gi}", "layers": layer_ids, "models": {}}
+
+            seqs = [("decode", 1)] if decode_only else [("prefill", prefill), ("decode", 1)]
+            for tag, seq in seqs:
+                module = Chunk(spec, params, layer_ids, seq, ctx)
+                example = example_inputs(spec, layout, seq, ctx)
+                name = f"chunk_{gi}_{tag}"
+                path = _trace_and_convert(module, layout["inputs"], layout["outputs"], example, name,
+                                          chunk_dir, precision)
+                entry = {"file": f"chunks/{name}.mlpackage", "seq": seq}
+                if check_plan:
+                    entry["plan"] = plan_summary(path, compute_units)
+                    log(f"  {name}: {entry['plan'].get('devices', entry['plan'])}")
+                entries["models"][tag] = entry
+                gc.collect()
+
+            chunks_meta.append(entries)
+            del params, module
+            gc.collect()
+
+        # Final norm + vocabulary slices of the tied LM head.
+        embed = sd.get_tensor("model.embed_tokens.weight").to(torch.float16)
+        norm = sd.get_tensor("model.embedding_norm.weight").to(torch.float16)
+        vocab = spec.vocab_size
+        step = math.ceil(vocab / head_chunks)
+        head_meta = []
+        for j, start in enumerate(range(0, vocab, step)):
+            end = min(start + step, vocab)
+            module = Head(spec, embed, norm, start, end)
+            example = {"hidden": torch.zeros(1, 1, spec.hidden_size, dtype=torch.float16)}
+            name = f"head_{j}"
+            path = _trace_and_convert(module, ["hidden"], ["logits"], example, name, head_dir, precision)
+            entry = {"file": f"head/{name}.mlpackage", "start": start, "end": end}
+            if check_plan:
+                entry["plan"] = plan_summary(path, compute_units)
+            head_meta.append(entry)
+            gc.collect()
+        log(f"  head: {len(head_meta)} chunks of {step} logits")
+
+    np.save(os.path.join(out_dir, "embedding.fp16.npy"), embed.numpy())
+    _copy_tokenizer(model_dir, out_dir)
+
+    manifest = {
+        "format": MANIFEST_FORMAT,
+        "lone_version": __version__,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "source": {"model_dir": os.path.abspath(model_dir)},
+        "spec": spec.to_dict(),
+        "shapes": {"ctx": ctx, "prefill": prefill, "decode": 1},
+        "precision": precision,
+        "chunks": chunks_meta,
+        "head": {"chunks": head_meta, "vocab": vocab},
+        "embedding": {"file": "embedding.fp16.npy", "vocab": vocab, "hidden": spec.hidden_size},
+        "tokenizer": {"dir": "tokenizer"},
+        "seconds": round(time.time() - started, 1),
+    }
+    with open(os.path.join(out_dir, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
+    log(f"wrote {out_dir}/manifest.json ({manifest['seconds']} s)")
+    return manifest
