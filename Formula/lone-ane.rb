@@ -9,7 +9,7 @@ class LoneAne < Formula
   version "0.0.1"
 
   depends_on "python@3.12"
-  depends_on :macos
+  depends_on :macos => :sequoia
 
   def install
     venv = virtualenv_create(libexec, "python3.12", system_site_packages: false)
@@ -30,5 +30,7 @@ class LoneAne < Formula
 
   test do
     assert_match "Usage", shell_output("#{bin}/lone --help")
+    system libexec/"bin/python", "-c",
+           "import coremltools, numpy, fastapi, uvicorn, tokenizers, safetensors, jinja2, typer"
   end
 end

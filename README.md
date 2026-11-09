@@ -6,7 +6,7 @@ arithmetic failures, which are the precision rules below.
 
 ## Install
 
-Apple Silicon, macOS 14+, Python 3.11+.
+Apple Silicon, macOS 15+, Python 3.11+.
 
 ```bash
 pip install lone-ane                  # run / serve
@@ -22,11 +22,13 @@ transformers for exact chat-template rendering (otherwise the bundled Jinja temp
 
 ```bash
 brew tap aj-gonzalez/lone https://github.com/AJ-Gonzalez/LoNE
+brew trust aj-gonzalez/lone
 brew install lone-ane
 ```
 
-The tap builds the `v0.0.1` source tag and installs the runtime (run/serve/verify). Conversion
-extras are not installed; add them to the formula's venv when needed:
+The tap builds the `v0.0.1` source tag and installs the runtime (run/serve/verify) into an isolated
+Python 3.12 venv. The runtime dependencies are resolved from PyPI at install time (no vendored
+Homebrew resources yet). Conversion extras are opt-in in that venv:
 
 ```bash
 "$(brew --prefix lone-ane)/libexec/bin/pip" install "torch==2.7.0" "scikit-learn>=1.4,<1.6" "transformers>=5.0"
