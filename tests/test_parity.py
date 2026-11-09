@@ -20,7 +20,7 @@ from lone.layout import chunk_layout
 from lone.torch_model import Chunk, example_inputs
 
 MODEL = os.environ.get("LONE_TEST_MODEL")
-pytestmark = pytest.mark.skipif(not MODEL, reason="set LONE_TEST_MODEL to a checkpoint directory")
+requires_model = pytest.mark.skipif(not MODEL, reason="set LONE_TEST_MODEL to a checkpoint directory")
 
 
 def cosine(a, b) -> float:
@@ -29,6 +29,7 @@ def cosine(a, b) -> float:
     return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
+@requires_model
 @pytest.mark.parametrize("seq", [1, 8])
 def test_layer_conversion_parity(tmp_path, seq):
     from safetensors import safe_open
@@ -60,3 +61,44 @@ def test_layer_conversion_parity(tmp_path, seq):
             got = runtime.predict({name: feed[name].numpy() for name in layout["inputs"]})
             for name, value in zip(layout["outputs"], expected):
                 assert cosine(value.numpy(), got[name]) >= 0.999, f"{spec.kind(layer)} layer {layer} {name}"
+
+
+def test_ffn_reduction_split_precision(tmp_path):
+    """A single wide output projection loses precision on the ANE; the two-way split does not.
+
+    Guards the fix from NOTES §13.6 with synthetic weights, so it runs without a checkpoint.
+    """
+    import coremltools as ct
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    torch.manual_seed(0)
+    hidden, ffn = 1024, 6656
+    gate = torch.randn(1, 1, ffn, dtype=torch.float16)
+    w2 = (torch.randn(hidden, ffn, dtype=torch.float16) * 0.02)
+
+    class Split(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = w2[:, : ffn // 2].contiguous()
+            self.b = w2[:, ffn // 2 :].contiguous()
+
+        def forward(self, g):
+            return F.linear(g[:, :, : ffn // 2], self.a) + F.linear(g[:, :, ffn // 2 :], self.b)
+
+    module = Split().eval()
+    with torch.no_grad():
+        expected = module(gate)
+        traced = torch.jit.trace(module, (gate,), strict=False)
+    mlmodel = ct.convert(
+        traced,
+        inputs=[ct.TensorType(name="g", shape=tuple(gate.shape), dtype=np.float16)],
+        outputs=[ct.TensorType(name="y", dtype=np.float16)],
+        convert_to="mlprogram",
+        minimum_deployment_target=ct.target.macOS15,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
+    )
+    package = str(tmp_path / "split.mlpackage")
+    mlmodel.save(package)
+    got = ct.models.MLModel(package, compute_units=ct.ComputeUnit.CPU_AND_NE).predict({"g": gate.numpy()})["y"]
+    assert cosine(expected.numpy(), got) > 0.9999

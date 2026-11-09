@@ -114,6 +114,14 @@ class DecoderLayer(nn.Module):
         self.w1 = params["w1"]
         self.w2 = params["w2"]
         self.w3 = params["w3"]
+        # The ANE loses precision on a single wide output projection (k=6656 measured at 0.997
+        # cosine versus torch, k=3328 at 0.99999). Split the reduction when the FFN is wide.
+        self.ffn_split = 2 if spec.intermediate_size > 4096 else 1
+        if self.ffn_split == 2:
+            half = spec.intermediate_size // 2
+            self.ffn_half = half
+            self.w2a = self.w2[:, :half].contiguous()
+            self.w2b = self.w2[:, half:].contiguous()
 
     def forward(self, x, *op_args):
         residual = x
@@ -127,7 +135,11 @@ class DecoderLayer(nn.Module):
         x = x + h
 
         ffn_in = rms(x, self.ffn_norm, self.eps)
-        f = F.linear(F.silu(F.linear(ffn_in, self.w1)) * F.linear(ffn_in, self.w3), self.w2)
+        gate = F.silu(F.linear(ffn_in, self.w1)) * F.linear(ffn_in, self.w3)
+        if self.ffn_split == 2:
+            f = F.linear(gate[:, :, : self.ffn_half], self.w2a) + F.linear(gate[:, :, self.ffn_half :], self.w2b)
+        else:
+            f = F.linear(gate, self.w2)
         if self.post_ffn_norm is not None:
             f = rms(f, self.post_ffn_norm, self.eps)
         x = x + f
@@ -173,9 +185,19 @@ class Head(nn.Module):
         self.eps = spec.norm_eps
         self.norm = norm
         self.weight = embed[start:end].contiguous()
+        # Same wide-reduction limit as the FFN: hidden 2048 measured 0.992 cosine on one linear.
+        self.split = 2 if spec.hidden_size > 1024 else 1
+        if self.split == 2:
+            half = spec.hidden_size // 2
+            self.half = half
+            self.wa = self.weight[:, :half].contiguous()
+            self.wb = self.weight[:, half:].contiguous()
 
     def forward(self, x):
-        return F.linear(rms(x, self.norm, self.eps), self.weight)
+        h = rms(x, self.norm, self.eps)
+        if self.split == 2:
+            return F.linear(h[:, :, : self.half], self.wa) + F.linear(h[:, :, self.half :], self.wb)
+        return F.linear(h, self.weight)
 
 
 def example_inputs(spec: ModelSpec, layout: dict, seq: int, ctx: int, dtype=torch.float16) -> dict:

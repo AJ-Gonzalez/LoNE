@@ -5,6 +5,9 @@ LFM3 and LFM2.5 on the Apple Neural Engine, via Core ML.
 Core ML is an energy play, not a speed play: decode is bandwidth-bound on the ANE, so expect
 MLX-class throughput at a much lower power envelope.
 
+LoNE splits wide reductions (FFN, LM head) because the ANE loses precision on them; the measured
+numbers and the failure modes are below.
+
 ## Requirements
 
 - Apple Silicon, macOS 14+ (measured on M1, 8 GB, macOS 26.6)
@@ -86,7 +89,10 @@ token re-reads every weight. A LUT6 bundle projects to ~1.10 GB/token and **~46 
 `[INFERENCE]` — MLX-4bit parity (47.6 tok/s) at lower power.
 
 LFM2.5-230M end-to-end (ctx 128, 1 layer per graph): logits cosine **0.99986** vs the HF fp16
-model; 50.7 tok/s decode over 32 tokens, 138 ms to the first token. Chat, streaming, `/metrics`
+model; 50.7 tok/s decode over 32 tokens, 138 ms to the first token.
+
+LFM2.5-350M end-to-end: logits cosine **0.99991**, greedy output identical to HF for 12 tokens
+(FFN 6656, split into two 3328-wide reductions). Chat, streaming, `/metrics`
 and the ANE byte counters were verified through the HTTP server.
 
 Chunk size is a precision knob on the ANE, not just a call-count knob: 1 layer per graph gives
@@ -103,6 +109,14 @@ Chunk size is a precision knob on the ANE, not just a call-count knob: 1 layer p
 - **Embedding gather runs on the CPU**; the LM head runs on the ANE in vocabulary slices.
 - **Prefill models load lazily** (decode models load at startup), but a bundle still stores both
   sequence shapes on disk. On 8 GB, prefer LUT6 or `--decode-only`.
+- **Wide reductions need splitting.** A single output projection loses precision on the ANE when
+  the reduction is wide. LoNE splits the FFN at 4096 (350M measured 0.9687 before the split,
+  0.99991 after) and the LM head at 1024 (LFM3's head, given an exact input, went from 0.992 to
+  1.0). The head split does not move LFM3's end-to-end 0.9882 — the stack drift dominates. Always
+  run the logits-parity check below before trusting a new model on the engine.
+- **Depth costs precision.** Per-layer ANE error accumulates: LFM3's last hidden state measures
+  0.937 cosine against HF after 24 layers, and end-to-end logits 0.9882. Below the bar; treat
+  LFM3 as experimental until the per-layer loss is reduced.
 - **Tools / structured output / logit_bias** are not implemented; `stop` strings are applied to the
   decoded text after generation.
 - Conversion expects a single-file `model.safetensors` (no sharded checkpoint support yet).
@@ -112,8 +126,21 @@ Chunk size is a precision knob on the ANE, not just a call-count knob: 1 layer p
 | Model | Status |
 |---|---|
 | LFM2.5-230M | full convert + generate + server smoke; per-layer math matches HF (cosine ≥ 0.99999) |
-| LFM3-1.7B | per-layer math verified (conv / full / sliding, cosine ≥ 0.99999); stack placement and per-token cost measured; full bundle not yet published |
-| LFM2.5-350M | same config path, not yet run |
+| LFM3-1.7B | converts and runs (24 layers, ctx 256, decode-only bundle). Logits cosine **0.9882** vs HF and the argmax matches, but parity is below the 0.999 bar. Per-layer hidden cosine drifts 0.998 → 0.937 over the 24 layers, so the residual error is the stack. The head split (0.992 → 1.0 given an exact input) does not change the end-to-end number. |
+| LFM2.5-350M | logits cosine **0.99991** vs HF, greedy output identical for 12 tokens (with the FFN split below) |
+
+## Verifying a conversion
+
+Per-layer parity against the reference torch modules:
+
+```bash
+LONE_TEST_MODEL=models/lfm2.5-230m pytest -q tests/test_parity.py
+```
+
+End-to-end: run the same prompt through the bundle and through `transformers` and compare the last
+logits (cosine ≥ 0.999 is the bar this repo works to). This is how the FFN-split requirement was
+found — per-layer conversion parity passes without it, while the full model does not. `lone inspect --bundle ...` shows the
+`MLComputePlan` placement recorded at conversion time.
 
 ## How it works
 
