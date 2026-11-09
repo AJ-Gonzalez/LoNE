@@ -13,9 +13,7 @@ class LoneAne < Formula
 
   def install
     venv = virtualenv_create(libexec, "python3.12")
-    system venv.python, "-m", "pip", "install", "--no-cache-dir", "--upgrade", "pip"
-    system venv.python, "-m", "pip", "install", "--no-cache-dir", buildpath.to_s
-    bin.install_symlink libexec/"bin/lone"
+    venv.pip_install_and_link(buildpath)
   end
 
   def caveats
