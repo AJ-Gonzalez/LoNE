@@ -14,6 +14,7 @@ from .layout import attention_mask, chunk_layout, cos_sin
 
 _COMPUTE_UNITS = {
     "cpu_and_ne": "CPU_AND_NE",
+    "cpu_and_gpu": "CPU_AND_GPU",
     "cpu_only": "CPU_ONLY",
     "all": "ALL",
 }
@@ -183,6 +184,8 @@ class LoneModel:
         layout = chunk["layout"]
         model = chunk["models"].get(tag)
         if model is None:
+            import coremltools as ct
+
             model = ct.models.MLModel(chunk["paths"][tag], compute_units=self._units)
             chunk["models"][tag] = model
         seq = hidden.shape[1]

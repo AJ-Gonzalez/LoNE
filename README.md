@@ -84,7 +84,7 @@ curl -s localhost:8082/v1/chat/completions -H 'Content-Type: application/json' -
 | `POST /v1/chat/completions` | OpenAI chat schema, SSE when `stream: true` |
 | `POST /v1/completions` | raw prompt, SSE when `stream: true` |
 | `GET /v1/models`, `/health` | harness probes |
-| `GET /metrics` | requests, tokens/s, last-request ANE bytes (IOReport) |
+| `GET /metrics` | requests, prefill/decode tokens/s and seconds, last-request ANE bytes (IOReport; streamed requests included) |
 
 Point EvalPlus (`--backend openai --base-url http://127.0.0.1:8082/v1`), lm-eval
 (`local-chat-completions`) or Harbor (`--api-format openai_chat_completions`) at it. One request is
@@ -110,15 +110,40 @@ token re-reads every weight, so residency is what decides throughput. A LUT6 bun
 (47.6 tok/s) at lower power.
 
 LFM2.5-230M end-to-end (ctx 128, 1 layer per graph): logits cosine **0.99987** vs the HF fp16
-model; 50.7 tok/s decode over 32 tokens, 138 ms to the first token.
+model; 50.7 tok/s decode over 32 tokens, 138 ms to the first token. **Placement is CPU** on this
+machine: the M1 planner declines the 14-layer graph (§12.3), so this is a CPU-path result, not ANE.
 
 LFM2.5-350M end-to-end: logits cosine **0.99989**, greedy output identical to HF for 12 tokens
-(FFN split into two wide reductions). Chat, streaming, `/metrics` and the ANE byte counters were
-verified through the HTTP server.
+(FFN split into two wide reductions). Chat, streaming and `/metrics` were verified through the
+HTTP server. **Placement is CPU** for the same reason; its ANE byte counters read zero.
 
 Chunk size is a precision knob on the ANE, not just a call-count knob: 1 layer per graph gives
 0.99986 logits cosine, 2 layers 0.9968, 4 layers 0.9969 on the same prompt. Keep
 `--layers-per-model 1` unless you have re-measured the tradeoff.
+
+## Engines: speed and power (LFM3-1.7B)
+
+Three execution paths for the same model: Core ML fp16 on the ANE, Core ML fp16 on the CPU, and
+MLX 4-bit on the Metal GPU (the only GPU path in this repo). Power is the engine's PMP energy
+channel over the measured window, idle-subtracted and read through IOReport without root.
+
+| Engine | Weights | Prefill tok/s | Decode tok/s | Prefill power | Decode power | J/token (decode) |
+|---|---|---:|---:|---:|---:|---:|
+| ANE (`CPU_AND_NE`) | fp16, 4.0 GB | 50.9 (32 tok) | 8.5 | 0.25 W | 0.59 W | 0.070 |
+| CPU (`CPU_ONLY`) | fp16, 4.0 GB | 2.73 (32 tok) | 0.20 | 0.45 W | 1.64 W | 8.2 |
+| GPU (MLX 4-bit, Metal) | 4-bit, 0.95 GB | 385.9 (512 tok) | 53.3 | 9.12 W | 6.04 W | 0.113 |
+
+![LFM3 throughput: prefill and decode](docs/tokens.svg)
+
+![Engine power during decode and prefill](docs/power.svg)
+
+Read these as engine numbers, not wall power: the ANE path's CPU orchestration adds ~1.7 W and
+DRAM ~0.9 W during decode, and the CPU row's total work power is 2.82 W (1.64 W above idle). The
+GPU row is 4-bit, the only Metal path here, while the ANE/CPU rows are fp16 — this is not a
+quantization-controlled comparison. LFM3 ANE decode varies **2–13 tok/s** with weight residency
+(one instrumented run measured 8.5 tok/s at 0.59 W; `lone run` warm measured 13.2 tok/s), so pair
+rate and power from the same run. Core ML `CPU_AND_GPU` (fp16) is not a real GPU path: 0.51 tok/s
+with 0.07 W on the GPU channel; the planner declines it.
 
 ## Limits
 
@@ -146,9 +171,9 @@ Chunk size is a precision knob on the ANE, not just a call-count knob: 1 layer p
 
 | Model | Status |
 |---|---|
-| LFM2.5-230M | full convert + generate + server smoke; logits cosine 0.99987, per-layer math matches HF (cosine ≥ 0.99999) |
+| LFM2.5-230M | full convert + generate + server smoke; logits cosine 0.99987, per-layer math matches HF (cosine ≥ 0.99999). CPU-placed by the M1 planner |
 | LFM3-1.7B | 24 layers, ctx 256, decode-only bundle. Logits cosine **0.99977** vs HF, argmax matches; per-layer hidden cosine 0.999995 → 0.99958 over the 24 layers; greedy diverges from HF after 6 of 12 tokens |
-| LFM2.5-350M | logits cosine **0.99989** vs HF, greedy output identical for 12 tokens (with the FFN split below) |
+| LFM2.5-350M | logits cosine **0.99989** vs HF, greedy output identical for 12 tokens (with the FFN split below). CPU-placed |
 
 ## Verify
 

@@ -25,6 +25,7 @@ def cmd_convert(args) -> None:
         precision=args.precision,
         head_chunks=args.head_chunks,
         decode_only=args.decode_only,
+        prefill_only=args.prefill_only,
         check_plan=not args.no_plan,
         compute_units=_units(args),
     )
@@ -115,8 +116,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--precision", choices=["fp16", "lut6"], default="fp16")
     c.add_argument("--head-chunks", type=int, default=8)
     c.add_argument("--decode-only", action="store_true", help="skip the prefill models (slower prompts)")
+    c.add_argument("--prefill-only", action="store_true", help="skip the decode models (prefill timing only)")
     c.add_argument("--no-plan", action="store_true", help="skip the MLComputePlan report")
-    c.add_argument("--compute-units", choices=["cpu_and_ne", "cpu_only", "all"], default="cpu_and_ne")
+    c.add_argument("--compute-units", choices=["cpu_and_ne", "cpu_and_gpu", "cpu_only", "all"], default="cpu_and_ne")
     c.set_defaults(func=cmd_convert)
 
     r = sub.add_parser("run", help="generate from a bundle")
@@ -131,7 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--seed", type=int, default=None)
     r.add_argument("--stream", action="store_true")
     r.add_argument("--cpu-only", action="store_true")
-    r.add_argument("--compute-units", choices=["cpu_and_ne", "cpu_only", "all"], default="cpu_and_ne")
+    r.add_argument("--compute-units", choices=["cpu_and_ne", "cpu_and_gpu", "cpu_only", "all"], default="cpu_and_ne")
     r.set_defaults(func=cmd_run)
 
     s = sub.add_parser("serve", help="OpenAI-compatible HTTP server")
@@ -139,7 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8082)
     s.add_argument("--cpu-only", action="store_true")
-    s.add_argument("--compute-units", choices=["cpu_and_ne", "cpu_only", "all"], default="cpu_and_ne")
+    s.add_argument("--compute-units", choices=["cpu_and_ne", "cpu_and_gpu", "cpu_only", "all"], default="cpu_and_ne")
     s.set_defaults(func=cmd_serve)
 
     i = sub.add_parser("inspect", help="print a bundle's spec and placement")

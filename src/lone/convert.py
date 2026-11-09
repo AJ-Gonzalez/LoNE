@@ -127,6 +127,7 @@ def plan_summary(pkg_path: str, compute_units: str = "cpu_and_ne") -> dict:
 
     units = {
         "cpu_and_ne": ct.ComputeUnit.CPU_AND_NE,
+        "cpu_and_gpu": ct.ComputeUnit.CPU_AND_GPU,
         "cpu_only": ct.ComputeUnit.CPU_ONLY,
         "all": ct.ComputeUnit.ALL,
     }[compute_units]
@@ -172,6 +173,7 @@ def convert_model(
     precision: str = "fp16",
     head_chunks: int = 8,
     decode_only: bool = False,
+    prefill_only: bool = False,
     check_plan: bool = True,
     compute_units: str = "cpu_and_ne",
     log=print,
@@ -196,6 +198,15 @@ def convert_model(
         f"{len(spec.layer_ids('conv'))} conv / {len(spec.layer_ids('full_attention'))} full / "
         f"{len(spec.layer_ids('sliding_attention'))} sliding, ctx {ctx}, prefill {prefill}")
 
+    if decode_only and prefill_only:
+        raise ValueError("--decode-only and --prefill-only are mutually exclusive")
+    if prefill_only:
+        seqs = [("prefill", prefill)]
+    elif decode_only:
+        seqs = [("decode", 1)]
+    else:
+        seqs = [("prefill", prefill), ("decode", 1)]
+
     groups = split_layers(spec.num_layers, layers_per_model)
     chunks_meta = []
     with safe_open(ckpt, framework="pt") as sd:
@@ -204,7 +215,6 @@ def convert_model(
             params = {i: _read_layer(sd, spec, i, torch.float16) for i in layer_ids}
             entries = {"name": f"chunk_{gi}", "layers": layer_ids, "models": {}}
 
-            seqs = [("decode", 1)] if decode_only else [("prefill", prefill), ("decode", 1)]
             for tag, seq in seqs:
                 module = Chunk(spec, params, layer_ids, seq, ctx)
                 example = example_inputs(spec, layout, seq, ctx)

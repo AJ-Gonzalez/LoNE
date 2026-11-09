@@ -18,6 +18,7 @@ from .metrics import ANECounters
 from .runtime import LoneModel
 
 MAX_TOKENS = 4096
+_DONE = ("done",)
 
 
 def _server_time() -> int:
@@ -36,7 +37,9 @@ def create_app(bundle_dir: str, compute_units: str = "cpu_and_ne"):
         "requests": 0,
         "prompt_tokens": 0,
         "completion_tokens": 0,
-        "generation_seconds": 0.0,
+        "decode_tokens": 0,
+        "prefill_seconds": 0.0,
+        "decode_seconds": 0.0,
         "last": None,
     }
     app = FastAPI(title="LoNE", version="0.0.1")
@@ -56,29 +59,76 @@ def create_app(bundle_dir: str, compute_units: str = "cpu_and_ne"):
             return []
         return [stop] if isinstance(stop, str) else list(stop)
 
-    def _record(prompt_tokens: int, ids: list[int], seconds: float) -> dict:
+    def _split(started: float, first_at: float | None, ended: float) -> tuple[float, float]:
+        """Prefill = until the first token is sampled; decode = everything after it."""
+        if first_at is None:
+            return ended - started, 0.0
+        return first_at - started, ended - first_at
+
+    def _record(prompt_tokens: int, ids: list[int], started: float, first_at: float | None,
+                ended: float) -> dict:
+        prefill_s, decode_s = _split(started, first_at, ended)
+        decode_tokens = max(len(ids) - 1, 0)
         stats["requests"] += 1
         stats["prompt_tokens"] += prompt_tokens
         stats["completion_tokens"] += len(ids)
-        stats["generation_seconds"] += seconds
+        stats["decode_tokens"] += decode_tokens
+        stats["prefill_seconds"] += prefill_s
+        stats["decode_seconds"] += decode_s
+        total = prefill_s + decode_s
         stats["last"] = {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": len(ids),
-            "seconds": round(seconds, 3),
-            "tokens_per_second": round(len(ids) / seconds, 2) if seconds else None,
-            "ane_bytes": stats.get("_ane_delta"),
+            "prefill_seconds": round(prefill_s, 3),
+            "decode_seconds": round(decode_s, 3),
+            "seconds": round(total, 3),
+            "prefill_tokens_per_second": round(prompt_tokens / prefill_s, 2) if prefill_s else None,
+            "decode_tokens_per_second": round(decode_tokens / decode_s, 2) if decode_s else None,
+            "tokens_per_second": round(len(ids) / total, 2) if total else None,
+            "ane_bytes": stats.get("_ane_delta") or {},
         }
         return stats["last"]
 
-    def _run(prompt_ids: list[int], params: dict) -> tuple[list[int], float, dict]:
+    def _run(prompt_ids: list[int], params: dict) -> tuple[list[int], float, float, float | None]:
         before = counters.read() if counters.ok else {}
         started = time.perf_counter()
-        ids = model.generate(prompt_ids, **params)
-        seconds = time.perf_counter() - started
+        first: list[float | None] = [None]
+
+        def on_token(_token: int) -> None:
+            if first[0] is None:
+                first[0] = time.perf_counter()
+
+        ids = model.generate(prompt_ids, on_token=on_token, **params)
+        ended = time.perf_counter()
         after = counters.read() if counters.ok else {}
-        delta = counters.delta(before, after) if after else {}
-        stats["_ane_delta"] = delta
-        return ids, seconds, delta
+        stats["_ane_delta"] = counters.delta(before, after) if after else {}
+        return ids, started, ended, first[0]
+
+    def _start_worker(prompt_ids: list[int], params: dict, q: queue.Queue,
+                      collected: list[int], timing: dict) -> None:
+        """Generate into a queue; read the ANE counters around the whole generation (stream path)."""
+
+        def worker() -> None:
+            before = counters.read() if counters.ok else {}
+            timing["started"] = time.perf_counter()
+            first: list[float | None] = [None]
+
+            def on_token(token: int) -> None:
+                if first[0] is None:
+                    first[0] = time.perf_counter()
+                collected.append(token)
+                q.put(token)
+
+            try:
+                model.generate(prompt_ids, on_token=on_token, **params)
+                timing["first"], timing["ended"] = first[0], time.perf_counter()
+                after = counters.read() if counters.ok else {}
+                stats["_ane_delta"] = counters.delta(before, after) if after else {}
+                q.put(_DONE)
+            except Exception as exc:  # surface to the client, then stop
+                q.put(exc)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     @app.get("/health")
     def health():
@@ -90,13 +140,19 @@ def create_app(bundle_dir: str, compute_units: str = "cpu_and_ne"):
 
     @app.get("/metrics")
     def metrics():
-        total = stats["generation_seconds"]
+        prefill = stats["prefill_seconds"]
+        decode = stats["decode_seconds"]
+        total = prefill + decode
         return {
             "model": model_name,
             "requests": stats["requests"],
             "prompt_tokens": stats["prompt_tokens"],
             "completion_tokens": stats["completion_tokens"],
-            "generation_seconds": round(total, 3),
+            "prefill_seconds": round(prefill, 3),
+            "decode_seconds": round(decode, 3),
+            "total_seconds": round(total, 3),
+            "prefill_tokens_per_second": round(stats["prompt_tokens"] / prefill, 2) if prefill else None,
+            "decode_tokens_per_second": round(stats["decode_tokens"] / decode, 2) if decode else None,
             "tokens_per_second": round(stats["completion_tokens"] / total, 2) if total else None,
             "ane_counters_available": counters.ok,
             "last": stats["last"],
@@ -117,9 +173,9 @@ def create_app(bundle_dir: str, compute_units: str = "cpu_and_ne"):
 
         if not streams:
             async with lock:
-                ids, seconds, _ = await asyncio.to_thread(_run, prompt_ids, params)
+                ids, started, ended, first_at = await asyncio.to_thread(_run, prompt_ids, params)
             text = _apply_stop(model.tokenizer.decode(ids), stops)
-            usage = _record(len(prompt_ids), ids, seconds)
+            usage = _record(len(prompt_ids), ids, started, first_at, ended)
             return {
                 "id": f"cmpl-{_server_time()}",
                 "object": "text_completion",
@@ -135,21 +191,13 @@ def create_app(bundle_dir: str, compute_units: str = "cpu_and_ne"):
             async with lock:
                 q: queue.Queue = queue.Queue()
                 collected: list[int] = []
-                started = time.perf_counter()
-
-                def worker():
-                    try:
-                        model.generate(prompt_ids, **params, on_token=lambda t: (collected.append(t), q.put(t)))
-                        q.put(None)
-                    except Exception as exc:  # surface to the client, then stop
-                        q.put(exc)
-
-                threading.Thread(target=worker, daemon=True).start()
+                timing: dict = {}
+                _start_worker(prompt_ids, params, q, collected, timing)
                 yield _sse({"id": f"cmpl-{_server_time()}", "object": "text_completion.chunk",
                             "model": model_name, "choices": [{"index": 0, "text": "", "finish_reason": None}]})
                 while True:
                     item = await asyncio.to_thread(q.get)
-                    if item is None:
+                    if isinstance(item, tuple) and item and item[0] == "done":
                         break
                     if isinstance(item, Exception):
                         yield _sse({"error": str(item)})
@@ -158,7 +206,7 @@ def create_app(bundle_dir: str, compute_units: str = "cpu_and_ne"):
                                 "model": model_name,
                                 "choices": [{"index": 0, "text": model.tokenizer.decode([item]),
                                              "finish_reason": None}]})
-                _record(len(prompt_ids), collected, time.perf_counter() - started)
+                _record(len(prompt_ids), collected, timing["started"], timing["first"], timing["ended"])
                 yield _sse({"id": f"cmpl-{_server_time()}", "object": "text_completion.chunk",
                             "model": model_name, "choices": [{"index": 0, "text": "",
                                                               "finish_reason": _finish(collected, params)}]})
@@ -177,9 +225,9 @@ def create_app(bundle_dir: str, compute_units: str = "cpu_and_ne"):
 
         if not streams:
             async with lock:
-                ids, seconds, _ = await asyncio.to_thread(_run, prompt_ids, params)
+                ids, started, ended, first_at = await asyncio.to_thread(_run, prompt_ids, params)
             text = _apply_stop(model.tokenizer.decode(ids), stops)
-            usage = _record(len(prompt_ids), ids, seconds)
+            usage = _record(len(prompt_ids), ids, started, first_at, ended)
             return {
                 "id": f"chatcmpl-{created}",
                 "object": "chat.completion",
@@ -196,22 +244,14 @@ def create_app(bundle_dir: str, compute_units: str = "cpu_and_ne"):
             async with lock:
                 q: queue.Queue = queue.Queue()
                 collected: list[int] = []
-                started = time.perf_counter()
-
-                def worker():
-                    try:
-                        model.generate(prompt_ids, **params, on_token=lambda t: (collected.append(t), q.put(t)))
-                        q.put(None)
-                    except Exception as exc:
-                        q.put(exc)
-
-                threading.Thread(target=worker, daemon=True).start()
+                timing: dict = {}
+                _start_worker(prompt_ids, params, q, collected, timing)
                 yield _sse({"id": f"chatcmpl-{created}", "object": "chat.completion.chunk", "created": created,
                             "model": model_name,
                             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
                 while True:
                     item = await asyncio.to_thread(q.get)
-                    if item is None:
+                    if isinstance(item, tuple) and item and item[0] == "done":
                         break
                     if isinstance(item, Exception):
                         yield _sse({"error": str(item)})
@@ -220,7 +260,7 @@ def create_app(bundle_dir: str, compute_units: str = "cpu_and_ne"):
                                 "created": created, "model": model_name,
                                 "choices": [{"index": 0, "delta": {"content": model.tokenizer.decode([item])},
                                              "finish_reason": None}]})
-                _record(len(prompt_ids), collected, time.perf_counter() - started)
+                _record(len(prompt_ids), collected, timing["started"], timing["first"], timing["ended"])
                 yield _sse({"id": f"chatcmpl-{created}", "object": "chat.completion.chunk", "created": created,
                             "model": model_name,
                             "choices": [{"index": 0, "delta": {}, "finish_reason": _finish(collected, params)}]})

@@ -231,5 +231,5 @@ def add_verify_parser(sub) -> None:
     v.add_argument("--allow-below", action="store_true", help="report but do not fail below the bar")
     v.add_argument("--json", action="store_true")
     v.add_argument("--cpu-only", action="store_true")
-    v.add_argument("--compute-units", choices=["cpu_and_ne", "cpu_only", "all"], default="cpu_and_ne")
+    v.add_argument("--compute-units", choices=["cpu_and_ne", "cpu_and_gpu", "cpu_only", "all"], default="cpu_and_ne")
     v.set_defaults(func=cmd_verify)
