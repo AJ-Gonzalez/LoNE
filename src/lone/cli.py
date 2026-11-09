@@ -145,6 +145,10 @@ def build_parser() -> argparse.ArgumentParser:
     i = sub.add_parser("inspect", help="print a bundle's spec and placement")
     i.add_argument("--bundle", required=True)
     i.set_defaults(func=cmd_inspect)
+
+    from .verify import add_verify_parser
+
+    add_verify_parser(sub)
     return p
 
 

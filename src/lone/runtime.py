@@ -206,7 +206,7 @@ class LoneModel:
             self._conv[i] = out[f"conv_{i}_out"].astype(np.float16)
         self._hidden = out["hidden_out"].astype(np.float16)
 
-    def _forward(self, ids: list[int], tag: str) -> None:
+    def _forward(self, ids: list[int], tag: str, capture: list | None = None) -> None:
         seq = len(ids)
         pos = self.pos
         if pos + seq > self.ctx:
@@ -217,6 +217,8 @@ class LoneModel:
         for chunk in self._chunks:
             self._run_chunk(chunk, tag, hidden, pos)
             hidden = self._hidden
+            if capture is not None:
+                capture.append(hidden[0].copy())
         self.pos = pos + seq
 
     def _logits(self) -> np.ndarray:

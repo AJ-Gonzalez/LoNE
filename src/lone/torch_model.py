@@ -21,6 +21,32 @@ def rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return weight * (x * torch.rsqrt(var + eps))
 
 
+# The ANE's linear cores lose precision when the products fall into fp16's subnormal range
+# (LFM3's conv operator: input absmax 0.066 x weights ~0.02). A power-of-two rescale of the
+# weights, undone on the output, is exact in real arithmetic and moves the accumulated terms
+# back into the normal range: operator cosine 0.99916 -> 0.9999998 on real activations.
+_SCALE = 16.0
+_INV_SCALE = 1.0 / _SCALE
+_WIDE = 1024
+
+
+def scaled_weight(w: torch.Tensor) -> tuple[torch.Tensor, float]:
+    """Scale a wide reduction's weights by 2^4; return (weights, 1/scale) for the output."""
+    if w.shape[1] > _WIDE:
+        return (w * _SCALE).contiguous(), _INV_SCALE
+    return w, 1.0
+
+
+def silu(x: torch.Tensor) -> torch.Tensor:
+    """SiLU without the ANE's fused `silu` approximation.
+
+    Core ML maps `aten::silu` (and `x * sigmoid(x)`) to an NE activation with ~1e-3 relative
+    error; the exp form keeps the activation off that path (measured 0.99935 -> 0.999991 on a
+    real LFM3 FFN).
+    """
+    return x / (1.0 + torch.exp(-x))
+
+
 def rotate_half(x: torch.Tensor, half: int) -> torch.Tensor:
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
 
@@ -39,19 +65,21 @@ class AttentionLayer(nn.Module):
         self.kind = kind
         self.has_gate = spec.attention_gate
 
-        self.wq = params["q_proj"]
-        self.wk = params["k_proj"]
-        self.wv = params["v_proj"]
-        self.wo = params["o_proj"]
+        self.wq, self.q_inv = scaled_weight(params["q_proj"])
+        self.wk, self.k_inv = scaled_weight(params["k_proj"])
+        self.wv, self.v_inv = scaled_weight(params["v_proj"])
+        self.wo, self.o_inv = scaled_weight(params["o_proj"])
         self.qn = params[spec.qk_norm_prefix]
         self.kn = params["k_norm" if spec.qk_norm_prefix == "q_norm" else "k_layernorm"]
         if self.has_gate:
-            self.wg = params["gate_proj"]
+            self.wg, self.g_inv = scaled_weight(params["gate_proj"])
 
     def forward(self, x, cos, sin, mask, k_past, v_past):
-        q = rms(F.linear(x, self.wq).view(1, self.seq, self.heads, self.hd), self.qn, self.eps).transpose(1, 2)
-        k = rms(F.linear(x, self.wk).view(1, self.seq, self.kv, self.hd), self.kn, self.eps).transpose(1, 2)
-        v = F.linear(x, self.wv).view(1, self.seq, self.kv, self.hd).transpose(1, 2)
+        q = rms((F.linear(x, self.wq) * self.q_inv).view(1, self.seq, self.heads, self.hd),
+                self.qn, self.eps).transpose(1, 2)
+        k = rms((F.linear(x, self.wk) * self.k_inv).view(1, self.seq, self.kv, self.hd),
+                self.kn, self.eps).transpose(1, 2)
+        v = (F.linear(x, self.wv) * self.v_inv).view(1, self.seq, self.kv, self.hd).transpose(1, 2)
 
         half = self.hd // 2
         c, s = cos.unsqueeze(1), sin.unsqueeze(1)
@@ -72,8 +100,8 @@ class AttentionLayer(nn.Module):
         att = torch.softmax(att, dim=-1)
         out = torch.matmul(att, vals).transpose(1, 2)  # (1, seq, heads, hd)
         if self.has_gate:
-            out = out * torch.sigmoid(F.linear(x, self.wg)).unsqueeze(-1)
-        return F.linear(out.reshape(1, self.seq, self.heads * self.hd), self.wo), k, v
+            out = out * torch.sigmoid(F.linear(x, self.wg) * self.g_inv).unsqueeze(-1)
+        return F.linear(out.reshape(1, self.seq, self.heads * self.hd), self.wo) * self.o_inv, k, v
 
 
 class ConvLayer(nn.Module):
@@ -82,17 +110,17 @@ class ConvLayer(nn.Module):
         self.seq = seq
         self.hidden = spec.hidden_size
         self.state_len = spec.conv_kernel - 1
-        self.win = params["in_proj"]
-        self.wout = params["out_proj"]
+        self.win, self.in_inv = scaled_weight(params["in_proj"])
+        self.wout, self.out_inv = scaled_weight(params["out_proj"])
         self.kernel = params["conv"]  # (hidden, 1, K)
 
     def forward(self, x, state):
-        bcx = F.linear(x, self.win).transpose(1, 2)  # (1, 3H, T)
+        bcx = (F.linear(x, self.win) * self.in_inv).transpose(1, 2)  # (1, 3H, T)
         b, c, g = bcx.chunk(3, dim=1)
         h = torch.cat((state, b * g), dim=-1)  # (1, H, T + K - 1)
         w = self.kernel[:, :, None, :]  # (H, 1, 1, K)
         y = F.conv2d(h.unsqueeze(2), w, groups=self.hidden)[:, :, 0, :]  # (1, H, T)
-        out = F.linear((c * y).transpose(1, 2).contiguous(), self.wout)
+        out = F.linear((c * y).transpose(1, 2).contiguous(), self.wout) * self.out_inv
         return out, h[:, :, -self.state_len :]
 
 
@@ -111,17 +139,19 @@ class DecoderLayer(nn.Module):
         self.ffn_norm = params["ffn_norm"]
         self.post_op_norm = params.get("post_operator_norm") if spec.sandwich_norm else None
         self.post_ffn_norm = params.get("post_ffn_norm") if spec.sandwich_norm else None
-        self.w1 = params["w1"]
-        self.w2 = params["w2"]
-        self.w3 = params["w3"]
+        self.w1, self.w1_inv = scaled_weight(params["w1"])
+        w2 = params["w2"]
+        self.w2, self.w2_inv = scaled_weight(w2)
+        self.w3, self.w3_inv = scaled_weight(params["w3"])
         # The ANE loses precision on a single wide output projection (k=6656 measured at 0.997
         # cosine versus torch, k=3328 at 0.99999). Split the reduction when the FFN is wide.
         self.ffn_split = 2 if spec.intermediate_size > 4096 else 1
         if self.ffn_split == 2:
             half = spec.intermediate_size // 2
             self.ffn_half = half
-            self.w2a = self.w2[:, :half].contiguous()
-            self.w2b = self.w2[:, half:].contiguous()
+            # Scale the raw halves, not self.w2 (already scaled above).
+            self.w2a, self.w2a_inv = scaled_weight(w2[:, :half].contiguous())
+            self.w2b, self.w2b_inv = scaled_weight(w2[:, half:].contiguous())
 
     def forward(self, x, *op_args):
         residual = x
@@ -135,11 +165,13 @@ class DecoderLayer(nn.Module):
         x = x + h
 
         ffn_in = rms(x, self.ffn_norm, self.eps)
-        gate = F.silu(F.linear(ffn_in, self.w1)) * F.linear(ffn_in, self.w3)
+        gate_in = F.linear(ffn_in, self.w1) * self.w1_inv
+        gate = silu(gate_in) * (F.linear(ffn_in, self.w3) * self.w3_inv)
         if self.ffn_split == 2:
-            f = F.linear(gate[:, :, : self.ffn_half], self.w2a) + F.linear(gate[:, :, self.ffn_half :], self.w2b)
+            f = (F.linear(gate[:, :, : self.ffn_half], self.w2a) * self.w2a_inv
+                 + F.linear(gate[:, :, self.ffn_half :], self.w2b) * self.w2b_inv)
         else:
-            f = F.linear(gate, self.w2)
+            f = F.linear(gate, self.w2) * self.w2_inv
         if self.post_ffn_norm is not None:
             f = rms(f, self.post_ffn_norm, self.eps)
         x = x + f
@@ -190,14 +222,18 @@ class Head(nn.Module):
         if self.split == 2:
             half = spec.hidden_size // 2
             self.half = half
-            self.wa = self.weight[:, :half].contiguous()
-            self.wb = self.weight[:, half:].contiguous()
+            self.wa, self.a_inv = scaled_weight(self.weight[:, :half].contiguous())
+            self.wb, self.b_inv = scaled_weight(self.weight[:, half:].contiguous())
+        else:
+            self.wa, self.a_inv = scaled_weight(self.weight)
+            self.half = 0
 
     def forward(self, x):
         h = rms(x, self.norm, self.eps)
         if self.split == 2:
-            return F.linear(h[:, :, : self.half], self.wa) + F.linear(h[:, :, self.half :], self.wb)
-        return F.linear(h, self.weight)
+            return (F.linear(h[:, :, : self.half], self.wa) * self.a_inv
+                    + F.linear(h[:, :, self.half :], self.wb) * self.b_inv)
+        return F.linear(h, self.wa) * self.a_inv
 
 
 def example_inputs(spec: ModelSpec, layout: dict, seq: int, ctx: int, dtype=torch.float16) -> dict:

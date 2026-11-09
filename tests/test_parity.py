@@ -63,6 +63,21 @@ def test_layer_conversion_parity(tmp_path, seq):
                 assert cosine(value.numpy(), got[name]) >= 0.999, f"{spec.kind(layer)} layer {layer} {name}"
 
 
+def test_exact_silu_matches_torch_silu():
+    """The exp form is mathematically SiLU; the ANE fuses the `silu` op with ~1e-3 error."""
+    import torch.nn.functional as F
+
+    from lone.torch_model import silu
+
+    torch.manual_seed(0)
+    x = (torch.randn(4096, dtype=torch.float16) * 3).half()
+    got = silu(x)
+    expected = F.silu(x)
+    max_abs = (got.float() - expected.float()).abs().max().item()
+    assert max_abs < 5e-2, f"silu rewrite departs from torch.silu by {max_abs}"
+    assert cosine(got.float().numpy(), expected.float().numpy()) > 0.9999
+
+
 def test_ffn_reduction_split_precision(tmp_path):
     """A single wide output projection loses precision on the ANE; the two-way split does not.
 
