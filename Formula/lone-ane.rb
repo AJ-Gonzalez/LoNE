@@ -13,7 +13,12 @@ class LoneAne < Formula
 
   def install
     venv = virtualenv_create(libexec, "python3.12")
-    venv.pip_install_and_link(buildpath)
+    python = Formula["python@3.12"].opt_bin/"python3.12"
+    # The Homebrew helper installs --no-deps (resources are expected); this tap
+    # resolves the runtime dependencies from PyPI instead.
+    system python, "-m", "pip", "--python=#{venv.root}/bin/python", "install", "--no-cache-dir", "pip"
+    system venv.root/"bin/pip", "install", "--no-cache-dir", buildpath.to_s
+    bin.install_symlink venv.root/"bin/lone"
   end
 
   def caveats
