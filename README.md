@@ -18,6 +18,20 @@ For a development checkout: `uv venv && source .venv/bin/activate && uv pip inst
 `convert` adds torch 2.7.0 and scikit-learn (coremltools' k-means palettizer); `chat` adds
 transformers for exact chat-template rendering (otherwise the bundled Jinja template is used).
 
+## Homebrew
+
+```bash
+brew tap aj-gonzalez/lone https://github.com/AJ-Gonzalez/LoNE
+brew install lone-ane
+```
+
+The tap builds the `v0.0.1` source tag and installs the runtime (run/serve/verify). Conversion
+extras are not installed; add them to the formula's venv when needed:
+
+```bash
+"$(brew --prefix lone-ane)/libexec/bin/pip" install "torch==2.7.0" "scikit-learn>=1.4,<1.6" "transformers>=5.0"
+```
+
 ## Quick start
 
 ```bash
