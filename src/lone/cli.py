@@ -81,7 +81,7 @@ def run(
     cpu_only: bool = typer.Option(False, "--cpu-only"),
     compute_units: ComputeUnits = typer.Option(ComputeUnits.cpu_and_ne, "--compute-units"),
     wire_caches: bool = typer.Option(
-        False, "--wire-caches", help="wire the KV cache with mlock so it cannot be paged out (macOS)"
+        False, "--wire-caches", help="wire the KV and conv caches with mlock so they cannot be paged out (macOS)"
     ),
 ) -> None:
     from .runtime import LoneModel
@@ -140,7 +140,7 @@ def serve(
     cpu_only: bool = typer.Option(False, "--cpu-only"),
     compute_units: ComputeUnits = typer.Option(ComputeUnits.cpu_and_ne, "--compute-units"),
     wire_caches: bool = typer.Option(
-        False, "--wire-caches", help="wire the KV cache with mlock so it cannot be paged out (macOS)"
+        False, "--wire-caches", help="wire the KV and conv caches with mlock so they cannot be paged out (macOS)"
     ),
 ) -> None:
     import uvicorn
