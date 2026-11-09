@@ -16,3 +16,4 @@ class Precision(str, Enum):
     fp16 = "fp16"
     lut4 = "lut4"
     lut6 = "lut6"
+    lut8 = "lut8"

@@ -109,7 +109,7 @@ def _trace_and_convert(module, input_names: list[str], output_names: list[str], 
         minimum_deployment_target=ct.target.macOS15,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
     )
-    bits = {"lut4": 4, "lut6": 6}.get(precision)
+    bits = {"lut4": 4, "lut6": 6, "lut8": 8}.get(precision)
     if bits is not None:
         from coremltools.optimize.coreml import OptimizationConfig, OpPalettizerConfig, palettize_weights
 

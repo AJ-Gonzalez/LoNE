@@ -45,7 +45,7 @@ lone verify --bundle bundles/lfm3-1.7b --model /path/to/LFM3-1.7B \
     --prompt "Explain in one sentence why the sky is blue."
 ```
 
-Convert flags: `--precision fp16|lut4|lut6`, `--layers-per-model 1`, `--head-chunks 8`,
+Convert flags: `--precision fp16|lut4|lut6|lut8`, `--layers-per-model 1`, `--head-chunks 8`,
 `--decode-only`/`--prefill-only`, `--no-plan`. Weights are stored once per sequence shape, so a
 full bundle is ~2x the fp16 checkpoint; `--decode-only` halves it.
 
@@ -123,18 +123,24 @@ varies **2–13 tok/s** with weight residency (8.5 tok/s in the instrumented win
 `lone run` warm, ~2 tok/s when the 4 GB stream from SSD), so pair rate and power from one run.
 `CPU_AND_GPU` is not a real GPU path: 0.51 tok/s with 0.07 W on the GPU channel.
 
-Quantized ANE (LFM3-1.7B) — both run fully on the NE, neither meets the parity bar:
+Quantized ANE (LFM3-1.7B) — all of these place every op on the NE; none meets the fp16 parity
+bar:
 
 | Weights | Bundle | Decode | ANE power | Energy/token | Logits cosine |
 |---|---:|---:|---:|---:|---:|
 | fp16 | 4.0 GB | 13.2 tok/s | 0.59 W | 0.070 J | 0.99977 |
+| LUT8 | 2.2 GB | 18.7 tok/s* | — | — | 0.9985 |
 | LUT6 | 1.8 GB | 20.5 tok/s | 0.87 W | 0.039 J | 0.9526 |
 | LUT4 | 1.4 GB | 30.7 tok/s | 0.88 W | 0.037 J | 0.786 |
 
+\* LUT8's parity and size are from a 57-token code prompt; its rate was sampled while a
+conversion was running and is a lower bound. Power for 8-bit weights is not measured.
+
 Rates are `lone run`; energy uses the paired instrumented window (LUT6 22.3, LUT4 23.6, fp16 8.5
 tok/s). LUT6 per-layer accuracy is 0.9973 (conv) / 0.9981 (attention) but compounds to 0.9526 over
-24 layers; LUT4 is 0.896 / 0.935. Palettized LFM3 needs QAT to ship; LUT6 is the useful
-memory/speed middle ground.
+24 layers; LUT4 is 0.896 / 0.935. The precision cliff is measured in NOTES §14.13: each extra LUT
+bit buys ~0.04 logits cosine in the 6–8 range, post-training 8-bit reaches 0.9985 and is the only
+LUT format near the bar, and 6-bit parity needs QAT.
 
 Those power figures are **1–2.5 s window averages**. A 60 s sustained LUT6 run measured 23.7 tok/s
 with the ANE rail at 1.04 W (43.9 mJ/token) and no throttling (10 s bins: 22.6 → 25.2 tok/s).
