@@ -18,6 +18,9 @@ import sys
 import tempfile
 
 import numpy as np
+import typer
+
+from .cli_options import ComputeUnits
 
 BAR = 0.999
 
@@ -166,30 +169,42 @@ def _reference_main(argv: list[str]) -> None:
     hf_reference(model_dir, json.loads(ids_json), out_path, int(max_new_tokens))
 
 
-def cmd_verify(args) -> None:
+def _verify(
+    bundle: str,
+    prompt: str,
+    model: str | None,
+    reference: str | None,
+    save_reference: str | None,
+    chat: bool,
+    system: str | None,
+    min_cos: float,
+    max_new_tokens: int,
+    allow_below: bool,
+    as_json: bool,
+    compute_units: str,
+) -> None:
     from .runtime import BundleTokenizer
 
-    tokenizer_dir = args.bundle
-    tok = BundleTokenizer(os.path.join(tokenizer_dir, "tokenizer"))
-    if args.chat:
-        messages = ([{"role": "system", "content": args.system}] if args.system else []) + [
-            {"role": "user", "content": args.prompt}
+    tok = BundleTokenizer(os.path.join(bundle, "tokenizer"))
+    if chat:
+        messages = ([{"role": "system", "content": system}] if system else []) + [
+            {"role": "user", "content": prompt}
         ]
         ids = tok.chat(messages)
     else:
-        ids = tok.encode(args.prompt)
+        ids = tok.encode(prompt)
 
-    reference_path = args.reference if args.reference and os.path.exists(args.reference) else None
+    reference_path = reference if reference and os.path.exists(reference) else None
     if reference_path is None:
-        if not args.model:
+        if not model:
             raise SystemExit("pass --model to compute the HF reference or --reference to reuse one")
-        reference_path = args.reference or args.save_reference
+        reference_path = reference or save_reference
         if reference_path is None:
             fd, reference_path = tempfile.mkstemp(suffix=".npz")
             os.close(fd)
         else:
             print(f"writing HF reference to {reference_path}")
-        _reference_subprocess(args.model, ids, reference_path, args.max_new_tokens)
+        _reference_subprocess(model, ids, reference_path, max_new_tokens)
 
     reference_data = np.load(reference_path)
     reference = {
@@ -202,34 +217,46 @@ def cmd_verify(args) -> None:
     if saved_ids != ids:
         raise SystemExit("reference was computed on different tokens; regenerate it")
 
-    bundle = bundle_capture(args.bundle, ids, _units(args), args.max_new_tokens)
-    result = compare(reference, bundle)
-    if args.json:
+    bundle_data = bundle_capture(bundle, ids, compute_units, max_new_tokens)
+    result = compare(reference, bundle_data)
+    if as_json:
         print(json.dumps(result, indent=2))
     else:
         _print_report(result, len(ids))
-    if not args.allow_below and result["logits"] < args.min_cos:
+    if not allow_below and result["logits"] < min_cos:
         raise SystemExit(1)
 
 
-def _units(args) -> str:
-    return "cpu_only" if getattr(args, "cpu_only", False) else getattr(args, "compute_units", "cpu_and_ne")
-
-
-def add_verify_parser(sub) -> None:
-    v = sub.add_parser("verify", help="compare a bundle against the HF reference")
-    v.add_argument("--bundle", required=True)
-    v.add_argument("--model", default=None, help="HF checkpoint directory used as the reference")
-    v.add_argument("--reference", default=None, help="reuse a cached reference .npz")
-    v.add_argument("--save-reference", default=None, help="write the reference .npz here")
-    v.add_argument("--prompt", required=True)
-    v.add_argument("--chat", action="store_true", help="render the prompt through the chat template")
-    v.add_argument("--system", default=None)
-    v.add_argument("--min-cos", type=float, default=BAR, help="logits cosine required to exit 0")
-    v.add_argument("--max-new-tokens", type=int, default=0,
-                   help="also compare this many greedy tokens against the HF reference")
-    v.add_argument("--allow-below", action="store_true", help="report but do not fail below the bar")
-    v.add_argument("--json", action="store_true")
-    v.add_argument("--cpu-only", action="store_true")
-    v.add_argument("--compute-units", choices=["cpu_and_ne", "cpu_and_gpu", "cpu_only", "all"], default="cpu_and_ne")
-    v.set_defaults(func=cmd_verify)
+def register_verify(app: typer.Typer) -> None:
+    @app.command("verify", help="compare a bundle against the HF reference")
+    def verify(
+        bundle: str = typer.Option(..., "--bundle"),
+        prompt: str = typer.Option(..., "--prompt"),
+        model: str | None = typer.Option(None, "--model", help="HF checkpoint directory used as the reference"),
+        reference: str | None = typer.Option(None, "--reference", help="reuse a cached reference .npz"),
+        save_reference: str | None = typer.Option(None, "--save-reference", help="write the reference .npz here"),
+        chat: bool = typer.Option(False, "--chat", help="render the prompt through the chat template"),
+        system: str | None = typer.Option(None, "--system"),
+        min_cos: float = typer.Option(BAR, "--min-cos", help="logits cosine required to exit 0"),
+        max_new_tokens: int = typer.Option(
+            0, "--max-new-tokens", help="also compare this many greedy tokens against the HF reference"
+        ),
+        allow_below: bool = typer.Option(False, "--allow-below", help="report but do not fail below the bar"),
+        as_json: bool = typer.Option(False, "--json"),
+        cpu_only: bool = typer.Option(False, "--cpu-only"),
+        compute_units: ComputeUnits = typer.Option(ComputeUnits.cpu_and_ne, "--compute-units"),
+    ) -> None:
+        _verify(
+            bundle=bundle,
+            prompt=prompt,
+            model=model,
+            reference=reference,
+            save_reference=save_reference,
+            chat=chat,
+            system=system,
+            min_cos=min_cos,
+            max_new_tokens=max_new_tokens,
+            allow_below=allow_below,
+            as_json=as_json,
+            compute_units="cpu_only" if cpu_only else compute_units.value,
+        )

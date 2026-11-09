@@ -1,47 +1,89 @@
-"""`lone` command line: convert, run, serve, inspect."""
+"""`lone` command line: convert, run, serve, inspect, verify.
+
+Typer wraps the same core functions; option names and defaults are unchanged from the argparse
+version. `main()` is kept as the console-script target.
+"""
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
 import time
 
+import typer
 
-def _units(args) -> str:
-    return "cpu_only" if getattr(args, "cpu_only", False) else getattr(args, "compute_units", "cpu_and_ne")
+from .cli_options import ComputeUnits, Precision
+
+app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="LFM models on the Apple Neural Engine",
+)
 
 
-def cmd_convert(args) -> None:
+def _units(cpu_only: bool, compute_units: ComputeUnits) -> str:
+    return "cpu_only" if cpu_only else compute_units.value
+
+
+@app.command(help="convert an HF checkpoint into a LoNE bundle")
+def convert(
+    model: str = typer.Option(..., "--model", help="HF checkpoint directory"),
+    out: str = typer.Option(..., "--out", help="bundle output directory"),
+    ctx: int = typer.Option(2048, "--ctx"),
+    prefill: int = typer.Option(64, "--prefill"),
+    layers_per_model: int = typer.Option(
+        1, "--layers-per-model", help="decoder layers per Core ML graph; 1 is the most accurate on ANE"
+    ),
+    precision: Precision = typer.Option(Precision.fp16, "--precision"),
+    head_chunks: int = typer.Option(8, "--head-chunks"),
+    decode_only: bool = typer.Option(False, "--decode-only", help="skip the prefill models (slower prompts)"),
+    prefill_only: bool = typer.Option(False, "--prefill-only", help="skip the decode models (prefill timing only)"),
+    plan: bool = typer.Option(True, "--plan/--no-plan", help="report the MLComputePlan placement per model"),
+    compute_units: ComputeUnits = typer.Option(ComputeUnits.cpu_and_ne, "--compute-units"),
+) -> None:
     from .convert import convert_model
 
     convert_model(
-        model_dir=args.model,
-        out_dir=args.out,
-        ctx=args.ctx,
-        prefill=args.prefill,
-        layers_per_model=args.layers_per_model,
-        precision=args.precision,
-        head_chunks=args.head_chunks,
-        decode_only=args.decode_only,
-        prefill_only=args.prefill_only,
-        check_plan=not args.no_plan,
-        compute_units=_units(args),
+        model_dir=model,
+        out_dir=out,
+        ctx=ctx,
+        prefill=prefill,
+        layers_per_model=layers_per_model,
+        precision=precision.value,
+        head_chunks=head_chunks,
+        decode_only=decode_only,
+        prefill_only=prefill_only,
+        check_plan=plan,
+        compute_units=compute_units.value,
     )
 
 
-def cmd_run(args) -> None:
+@app.command(help="generate from a bundle")
+def run(
+    bundle: str = typer.Option(..., "--bundle"),
+    prompt: str = typer.Option(..., "--prompt"),
+    chat: bool = typer.Option(False, "--chat", help="render the prompt through the chat template"),
+    system: str | None = typer.Option(None, "--system"),
+    max_new_tokens: int = typer.Option(256, "--max-new-tokens"),
+    temperature: float = typer.Option(0.0, "--temperature"),
+    top_p: float = typer.Option(1.0, "--top-p"),
+    top_k: int = typer.Option(0, "--top-k"),
+    seed: int | None = typer.Option(None, "--seed"),
+    stream: bool = typer.Option(False, "--stream"),
+    cpu_only: bool = typer.Option(False, "--cpu-only"),
+    compute_units: ComputeUnits = typer.Option(ComputeUnits.cpu_and_ne, "--compute-units"),
+) -> None:
     from .runtime import LoneModel
 
-    model = LoneModel(args.bundle, _units(args))
-    if args.chat:
-        messages = ([{"role": "system", "content": args.system}] if args.system else []) + [
-            {"role": "user", "content": args.prompt}
+    model = LoneModel(bundle, _units(cpu_only, compute_units))
+    if chat:
+        messages = ([{"role": "system", "content": system}] if system else []) + [
+            {"role": "user", "content": prompt}
         ]
         prompt_ids = model.tokenizer.chat(messages)
     else:
-        prompt_ids = model.tokenizer.encode(args.prompt)
+        prompt_ids = model.tokenizer.encode(prompt)
 
     first = {"at": None}
     emitted = []
@@ -51,42 +93,51 @@ def cmd_run(args) -> None:
         if first["at"] is None:
             first["at"] = time.perf_counter()
         emitted.append(token)
-        if args.stream:
+        if stream:
             sys.stdout.write(model.tokenizer.decode([token]))
             sys.stdout.flush()
 
     ids = model.generate(
         prompt_ids,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        seed=args.seed,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        seed=seed,
         on_token=on_token,
     )
     wall = time.perf_counter() - started
     text = model.tokenizer.decode(ids)
-    if args.stream:
+    if stream:
         sys.stdout.write("\n")
     else:
         print(text)
     prefill_s = (first["at"] or started) - started
     decode_s = max(wall - prefill_s, 1e-9)
-    print(f"\n[{len(ids)} tokens | {len(ids) / decode_s:.1f} tok/s | first token {prefill_s * 1e3:.0f} ms | "
+    decode_tokens = max(len(ids) - 1, 0)
+    rate = decode_tokens / decode_s if decode_tokens else 0.0
+    print(f"\n[{len(ids)} tokens | {rate:.1f} tok/s | first token {prefill_s * 1e3:.0f} ms | "
           f"{len(prompt_ids)} prompt tokens]", file=sys.stderr)
 
 
-def cmd_serve(args) -> None:
+@app.command(help="OpenAI-compatible HTTP server")
+def serve(
+    bundle: str = typer.Option(..., "--bundle"),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8082, "--port"),
+    cpu_only: bool = typer.Option(False, "--cpu-only"),
+    compute_units: ComputeUnits = typer.Option(ComputeUnits.cpu_and_ne, "--compute-units"),
+) -> None:
     import uvicorn
 
     from .server import create_app
 
-    app = create_app(args.bundle, _units(args))
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(create_app(bundle, _units(cpu_only, compute_units)), host=host, port=port, log_level="info")
 
 
-def cmd_inspect(args) -> None:
-    with open(os.path.join(args.bundle, "manifest.json")) as f:
+@app.command("inspect", help="print a bundle's spec and placement")
+def inspect_cmd(bundle: str = typer.Option(..., "--bundle")) -> None:
+    with open(os.path.join(bundle, "manifest.json")) as f:
         manifest = json.load(f)
     spec = manifest["spec"]
     print(f"{spec['model_type']}: {spec['num_layers']} layers, hidden {spec['hidden_size']}, "
@@ -102,61 +153,13 @@ def cmd_inspect(args) -> None:
     print(f"  head: {len(manifest['head']['chunks'])} chunks")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="lone", description="LFM models on the Apple Neural Engine")
-    sub = p.add_subparsers(dest="cmd", required=True)
+from .verify import register_verify  # noqa: E402  (needs `app` above)
 
-    c = sub.add_parser("convert", help="convert an HF checkpoint into a LoNE bundle")
-    c.add_argument("--model", required=True, help="HF checkpoint directory")
-    c.add_argument("--out", required=True, help="bundle output directory")
-    c.add_argument("--ctx", type=int, default=2048)
-    c.add_argument("--prefill", type=int, default=64)
-    c.add_argument("--layers-per-model", type=int, default=1,
-                   help="decoder layers per Core ML graph; 1 is the most accurate on ANE")
-    c.add_argument("--precision", choices=["fp16", "lut4", "lut6"], default="fp16")
-    c.add_argument("--head-chunks", type=int, default=8)
-    c.add_argument("--decode-only", action="store_true", help="skip the prefill models (slower prompts)")
-    c.add_argument("--prefill-only", action="store_true", help="skip the decode models (prefill timing only)")
-    c.add_argument("--no-plan", action="store_true", help="skip the MLComputePlan report")
-    c.add_argument("--compute-units", choices=["cpu_and_ne", "cpu_and_gpu", "cpu_only", "all"], default="cpu_and_ne")
-    c.set_defaults(func=cmd_convert)
-
-    r = sub.add_parser("run", help="generate from a bundle")
-    r.add_argument("--bundle", required=True)
-    r.add_argument("--prompt", required=True)
-    r.add_argument("--chat", action="store_true", help="render the prompt through the chat template")
-    r.add_argument("--system", default=None)
-    r.add_argument("--max-new-tokens", type=int, default=256)
-    r.add_argument("--temperature", type=float, default=0.0)
-    r.add_argument("--top-p", type=float, default=1.0)
-    r.add_argument("--top-k", type=int, default=0)
-    r.add_argument("--seed", type=int, default=None)
-    r.add_argument("--stream", action="store_true")
-    r.add_argument("--cpu-only", action="store_true")
-    r.add_argument("--compute-units", choices=["cpu_and_ne", "cpu_and_gpu", "cpu_only", "all"], default="cpu_and_ne")
-    r.set_defaults(func=cmd_run)
-
-    s = sub.add_parser("serve", help="OpenAI-compatible HTTP server")
-    s.add_argument("--bundle", required=True)
-    s.add_argument("--host", default="127.0.0.1")
-    s.add_argument("--port", type=int, default=8082)
-    s.add_argument("--cpu-only", action="store_true")
-    s.add_argument("--compute-units", choices=["cpu_and_ne", "cpu_and_gpu", "cpu_only", "all"], default="cpu_and_ne")
-    s.set_defaults(func=cmd_serve)
-
-    i = sub.add_parser("inspect", help="print a bundle's spec and placement")
-    i.add_argument("--bundle", required=True)
-    i.set_defaults(func=cmd_inspect)
-
-    from .verify import add_verify_parser
-
-    add_verify_parser(sub)
-    return p
+register_verify(app)
 
 
-def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
-    args.func(args)
+def main() -> None:
+    app()
 
 
 if __name__ == "__main__":

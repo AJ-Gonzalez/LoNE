@@ -15,6 +15,7 @@ dependencies = [
     "safetensors>=0.4",
     "tokenizers>=0.20",
     "jinja2>=3.1",
+    "typer>=0.12",
     "fastapi>=0.115",
     "uvicorn>=0.30",
 ]
