@@ -129,12 +129,12 @@ bar:
 | Weights | Bundle | Decode | ANE power | Energy/token | Logits cosine |
 |---|---:|---:|---:|---:|---:|
 | fp16 | 4.0 GB | 13.2 tok/s | 0.59 W | 0.070 J | 0.99977 |
-| LUT8 | 2.2 GB | 18.7 tok/s* | — | — | 0.9985 |
+| LUT8 | 2.2 GB | 23.1 tok/s | — | — | 0.9985 |
 | LUT6 | 1.8 GB | 20.5 tok/s | 0.87 W | 0.039 J | 0.9526 |
 | LUT4 | 1.4 GB | 30.7 tok/s | 0.88 W | 0.037 J | 0.786 |
 
-\* LUT8's parity and size are from a 57-token code prompt; its rate was sampled while a
-conversion was running and is a lower bound. Power for 8-bit weights is not measured.
+\* LUT8's parity is from a 57-token code prompt (LUT6 measures 0.9616 on that same prompt); the
+other rows use an earlier, shorter prompt. Power for 8-bit weights is not measured.
 
 Rates are `lone run`; energy uses the paired instrumented window (LUT6 22.3, LUT4 23.6, fp16 8.5
 tok/s). LUT6 per-layer accuracy is 0.9973 (conv) / 0.9981 (attention) but compounds to 0.9526 over
