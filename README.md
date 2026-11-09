@@ -146,73 +146,17 @@ quantization-controlled comparison. LFM3 ANE decode varies **2–13 tok/s** with
 rate and power from the same run. Core ML `CPU_AND_GPU` (fp16) is not a real GPU path: 0.51 tok/s
 with 0.07 W on the GPU channel; the planner declines it.
 
-**4-bit (LUT4) on the ANE:** yes. `--precision lut4` palettizes the weights and the whole stack
-stays NE (56/104 ops per chunk), 4x smaller (1.4 GB bundle for LFM3). It decodes at **30.7 tok/s**
-(`lone run`) with **0.88 W** on the ANE channel (~37 mJ/token). Accuracy is the blocker:
-post-training kmeans at 4 bits measures 0.90 (conv) / 0.93 (attention) per-layer cosine,
-end-to-end logits **0.786**, argmax mismatch, and greedy diverges at token 0. Not usable without
-quantization-aware training or a better scheme. LUT6 converts now (298 MB for 230M) but
-measures **0.99506** logits cosine on LFM2.5-230M — better than LUT4, still below the bar; LFM3
-LUT6 has not been run.
+**Quantized ANE (LFM3-1.7B):** both palettized formats run fully on the NE. LUT6 is the better
+trade; neither meets the 0.999 parity bar.
 
-## Limits
+| ANE weights | Bundle | Decode | ANE power | Energy/token | Logits cosine |
+|---|---:|---:|---:|---:|---:|
+| fp16 | 4.0 GB | 13.2 tok/s | 0.59 W | 0.070 J | 0.99977 |
+| LUT6 | 1.8 GB | 20.5 tok/s | 0.87 W | 0.039 J | 0.9526 |
+| LUT4 | 1.4 GB | 30.7 tok/s | 0.88 W | 0.037 J | 0.786 |
 
-- **Static shapes.** Context and prefill length are frozen at conversion; unused context is masked.
-  Prompt remainders beyond the last full prefill chunk are decoded one token at a time.
-- **fp16 only.** The ANE has no fp32 path; the reference tolerance is per-layer, and drift
-  accumulates with stack depth (hence the 1-layer default).
-- **No batching.** One request at a time, no continuous batching, no left-padded prompts.
-- **Embedding gather runs on the CPU**; the LM head runs on the ANE in vocabulary slices.
-- **Prefill models load lazily** (decode models load at startup), but a bundle still stores both
-  sequence shapes on disk. On 8 GB, prefer LUT6 or `--decode-only`.
-- **Wide reductions need splitting *and* rescaling.** A single output projection loses precision
-  on the ANE when the reduction is wide, and any wide reduction loses precision when its products
-  fall subnormal. LoNE splits the FFN at 4096 (350M measured 0.9687 before the split, 0.99989
-  after) and the LM head at 1024, and scales every `k > 1024` reduction by 2^4 with the output
-  rescaled (rule table above). Always run `lone verify` before trusting a new model on the engine.
-- **Depth costs precision, slowly.** With the rules above, LFM3's per-layer hidden cosine stays
-  ≥0.99958 over 24 layers and end-to-end logits measure **0.99977** — above the 0.999 bar, but
-  with less headroom than LFM2.5.
-- **Tools / structured output / logit_bias** are not implemented; `stop` strings are applied to the
-  decoded text after generation.
-- Conversion expects a single-file `model.safetensors` (no sharded checkpoint support yet).
-
-## Models tested
-
-| Model | Status |
-|---|---|
-| LFM2.5-230M | full convert + generate + server smoke; logits cosine 0.99987, per-layer math matches HF (cosine ≥ 0.99999). CPU-placed by the M1 planner |
-| LFM3-1.7B | 24 layers, ctx 256, decode-only bundle. Logits cosine **0.99977** vs HF, argmax matches; per-layer hidden cosine 0.999995 → 0.99958 over the 24 layers; greedy diverges from HF after 6 of 12 tokens |
-| LFM2.5-350M | logits cosine **0.99989** vs HF, greedy output identical for 12 tokens (with the FFN split below). CPU-placed |
-
-## Verify
-
-End-to-end parity is one command. The HF checkpoint and the Core ML bundle never share a process:
-the reference phase runs in a subprocess and caches the hidden states, then the bundle runs its
-decode path token by token.
-
-```bash
-lone verify --bundle bundles/lfm3-1.7b --model models/lfm3-1.7b-torch \
-    --prompt "Explain in one sentence why the sky is blue." --reference /tmp/ref-lfm3.npz
-```
-
-It prints logits cosine, argmax agreement, the per-layer hidden-state drift curve, and — with
-`--max-new-tokens N` — the greedy token sequences and the index of the first divergence. It exits
-non-zero below `--min-cos` (default 0.999). Reuse the saved `.npz` for repeat runs (`--reference`
-only) or with `--cpu-only` to separate a mapping error from an ANE arithmetic error.
-
-Per-layer parity against the reference torch modules (fast, but it only compares our module to its
-converted form, so it cannot catch the ANE-specific rules above):
-
-```bash
-LONE_TEST_MODEL=models/lfm2.5-230m pytest -q tests/test_parity.py
-```
-
-## How it works
-
-The 24-layer stack is split into contiguous chunks; each chunk is one `mlprogram` per sequence
-shape (prefill, decode). Caches are ordinary tensors: K/V per attention layer and the
-`conv_kernel-1` token window per conv layer, concatenated as `past || new` inside the graph. The
-runtime owns the buffers and passes an additive mask that encodes both the causal structure and
-which rows of the preallocated cache are real. LM head and final norm are separate vocabulary
-slices. No Core ML state buffers are used, so conversion stays on the TorchScript path.
+Decode rates are `lone run`; power is the ANE PMP channel (idle-subtracted) and energy/token uses
+the paired instrumented window (LUT6 22.3 tok/s, LUT4 23.6, fp16 8.5). Per-layer LUT6 accuracy is
+0.9973 (conv) / 0.9981 (attention) but compounds to 0.9526 over 24 layers; LUT4 is 0.896 / 0.935.
+LUT6 therefore needs QAT or a calibration pass to ship, but it is the useful middle ground for
+memory/speed experiments. LFM2.5-230M LUT6 measures 0.99506.
