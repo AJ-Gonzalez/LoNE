@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-convert = ["torch==2.7.0"]
+convert = ["torch==2.7.0", "scikit-learn>=1.4"]
 chat = ["transformers>=5.0"]
 test = ["pytest>=8"]
 

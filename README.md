@@ -29,7 +29,8 @@ two orders of magnitude below the fp16 maximum. The norm reductions do not need 
 
 - Apple Silicon, macOS 14+ (measured on M1, 8 GB, macOS 26.6)
 - Python 3.11+
-- Conversion: `torch==2.7.0` (the version coremltools 9.0 tests against)
+- Conversion: `torch==2.7.0` (the version coremltools 9.0 tests against) and `scikit-learn`
+  (coremltools' k-means palettizer needs it for `lut4`/`lut6`)
 
 ## Install
 
@@ -150,7 +151,9 @@ stays NE (56/104 ops per chunk), 4x smaller (1.4 GB bundle for LFM3). It decodes
 (`lone run`) with **0.88 W** on the ANE channel (~37 mJ/token). Accuracy is the blocker:
 post-training kmeans at 4 bits measures 0.90 (conv) / 0.93 (attention) per-layer cosine,
 end-to-end logits **0.786**, argmax mismatch, and greedy diverges at token 0. Not usable without
-quantization-aware training or a better scheme. LUT6 parity is still unmeasured.
+quantization-aware training or a better scheme. LUT6 converts now (298 MB for 230M) but
+measures **0.99506** logits cosine on LFM2.5-230M — better than LUT4, still below the bar; LFM3
+LUT6 has not been run.
 
 ## Limits
 
