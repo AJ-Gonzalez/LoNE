@@ -9,6 +9,7 @@ the subscription handle is returned by `IOReportCreateSubscription`, not by its 
 from __future__ import annotations
 
 import ctypes
+import os
 import platform
 from ctypes import POINTER, c_int64, c_uint32, c_uint64, c_void_p, byref
 
@@ -139,3 +140,122 @@ class ANECounters:
 
     def delta(self, before: dict, after: dict) -> dict:
         return {k: after.get(k, 0) - before.get(k, 0) for k in set(before) | set(after)}
+
+
+# --------------------------------------------------------------------------- power and memory
+POWER_GROUP = "PMP"
+POWER_UNIT = "mJ"
+
+
+class PowerCounters:
+    """Per-rail energy counters (mJ) from the `PMP` group; None when unavailable.
+
+    Channels are cumulative and system-wide: `ANE` is the engine rail LoNE drives, `DRAM` and the
+    CPU rails are whole-machine and move with anything else running. Convert a window to watts with
+    `watts(before, after, seconds)`.
+    """
+
+    def __init__(self):
+        self._sub = None
+        if not available():
+            return
+        try:
+            sub = _Subscription(POWER_GROUP)
+            rows = _rows(sub.sample())
+            if not any(r["unit"] == POWER_UNIT and r["name"] == "ANE" for r in rows):
+                return
+            self._sub = sub
+        except Exception:
+            self._sub = None
+
+    @property
+    def ok(self) -> bool:
+        return self._sub is not None
+
+    def read(self) -> dict:
+        if self._sub is None:
+            return {}
+        return {r["name"]: r["value"] for r in _rows(self._sub.sample())
+                if r["unit"] == POWER_UNIT}
+
+    def watts(self, before: dict, after: dict, seconds: float) -> dict:
+        """Average watts per rail over a window; empty when the counters are unavailable."""
+        if seconds <= 0 or not before or not after:
+            return {}
+        return {name: (after.get(name, 0) - before.get(name, 0)) / 1000.0 / seconds for name in before}
+
+
+class _MachTaskBasicInfo(ctypes.Structure):
+    _fields_ = [
+        ("virtual_size", c_uint64),
+        ("resident_size", c_uint64),
+        ("resident_size_max", c_uint64),
+        ("user_time_sec", ctypes.c_int32),
+        ("user_time_usec", ctypes.c_int32),
+        ("system_time_sec", ctypes.c_int32),
+        ("system_time_usec", ctypes.c_int32),
+        ("policy", ctypes.c_int32),
+        ("suspend_count", ctypes.c_int32),
+    ]
+
+
+class _VMStatistics64(ctypes.Structure):
+    _fields_ = [
+        ("free_count", ctypes.c_uint32),
+        ("active_count", ctypes.c_uint32),
+        ("inactive_count", ctypes.c_uint32),
+        ("wire_count", ctypes.c_uint32),
+        ("zero_fill_count", c_uint64),
+        ("reactivations", c_uint64),
+        ("pageins", c_uint64),
+        ("pageouts", c_uint64),
+        ("faults", c_uint64),
+        ("cow_faults", c_uint64),
+        ("lookups", c_uint64),
+        ("hits", c_uint64),
+        ("purges", c_uint64),
+        ("purgeable_count", c_uint64),
+        ("speculative_count", c_uint64),
+        ("decompressions", c_uint64),
+        ("compressions", c_uint64),
+        ("swapins", c_uint64),
+        ("swapouts", c_uint64),
+        ("compressor_page_count", ctypes.c_uint32),
+        ("throttled_count", ctypes.c_uint32),
+        ("external_page_count", ctypes.c_uint32),
+        ("internal_page_count", ctypes.c_uint32),
+        ("total_uncompressed_pages_in_compressor", c_uint64),
+    ]
+
+
+_MACH_TASK_BASIC_INFO = 20
+_HOST_VM_INFO64 = 4
+
+
+def memory() -> dict:
+    """Process resident size and system memory state, in bytes; empty when unavailable."""
+    if not available():
+        return {}
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mach_task_self.restype = ctypes.c_uint32
+    libc.mach_host_self.restype = ctypes.c_uint32
+    page = os.sysconf("SC_PAGE_SIZE")
+
+    info = _MachTaskBasicInfo()
+    count = ctypes.c_uint32(ctypes.sizeof(info) // 4)
+    task = libc.mach_task_self()
+    if libc.task_info(task, _MACH_TASK_BASIC_INFO, byref(info), byref(count)) != 0:
+        return {}
+
+    vm = _VMStatistics64()
+    vm_count = ctypes.c_uint32(ctypes.sizeof(vm) // 4)
+    if libc.host_statistics64(libc.mach_host_self(), _HOST_VM_INFO64, byref(vm), byref(vm_count)) != 0:
+        return {"resident": info.resident_size}
+
+    # Only fields whose offsets are verified against `vm_stat` on this machine: resident, peak and
+    # free pages. Later vm_statistics64 fields drift between macOS releases.
+    return {
+        "resident": info.resident_size,
+        "resident_peak": info.resident_size_max,
+        "free": vm.free_count * page,
+    }

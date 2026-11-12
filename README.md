@@ -76,6 +76,29 @@ One request at a time; Core ML serialises predictions anyway. `--cpu-only` and
 `--compute-units {cpu_and_ne,cpu_and_gpu,cpu_only,all}` select the engine. Point EvalPlus
 (`--backend openai`), lm-eval (`local-chat-completions`) or Harbor at the OpenAI endpoint.
 
+## Chat
+
+```bash
+lone chat --bundle bundles/lfm3-1.7b --system "Be terse."
+```
+
+One process, one stats block per turn (measured on the 230M bundle):
+
+```
+you> Hi
+lone> Hello! How can I help you today
+  prefill 11 tok 0.10 s 104.8 tok/s 0.97 W · decode 5 tok 0.08 s 66.6 tok/s 0.73 W
+  ctx 17/128 (13.3%) · mem 0.59 GB rss · 0.07 GB free · ane io 11.15 GB
+```
+
+Prefill is measured until the first sampled token (the same convention as `/metrics`), decode after
+it. `ctx` is the tokens the caches hold against the bundle's context; `mem` is process RSS and
+system free memory; the watts are the ANE rail from the `PMP` group, whose counters are cumulative
+and system-wide, so a short turn is noisy and a background process shows up in the number. `ane io`
+is the ANE read+write traffic the turn moved. History is fed incrementally — each turn prefills only
+the tokens the chat template added — and `/reset` clears the conversation while keeping the weights
+loaded.
+
 ## Precision rules
 
 The ANE's arithmetic differs from torch's fp16 in three measurable ways; `torch_model` implements

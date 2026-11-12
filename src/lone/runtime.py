@@ -313,10 +313,8 @@ class LoneModel:
             chunk["models"].pop("prefill", None)
 
     # --------------------------------------------------------------- generate
-    def prefill(self, ids: list[int]) -> None:
-        if not ids:
-            raise LoneError("empty prompt")
-        self.reset()
+    def feed(self, ids: list[int]) -> None:
+        """Process `ids` as new tokens, keeping the caches (incremental prefill)."""
         remaining = list(ids)
         has_prefill = all("prefill" in c["paths"] for c in self._chunks)
         while has_prefill and len(remaining) >= self.prefill_len:
@@ -325,6 +323,12 @@ class LoneModel:
         while remaining:
             self._forward(remaining[:1], "decode")
             remaining = remaining[1:]
+
+    def prefill(self, ids: list[int]) -> None:
+        if not ids:
+            raise LoneError("empty prompt")
+        self.reset()
+        self.feed(ids)
 
     def step(self, token_id: int) -> np.ndarray:
         self._forward([token_id], "decode")
@@ -342,6 +346,19 @@ class LoneModel:
         on_token=None,
     ) -> list[int]:
         self.prefill(prompt_ids)
+        return self.generate_next(max_new_tokens, temperature, top_p, top_k, stop_ids, seed, on_token)
+
+    def generate_next(
+        self,
+        max_new_tokens: int = 256,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        stop_ids: list[int] | None = None,
+        seed: int | None = None,
+        on_token=None,
+    ) -> list[int]:
+        """Sample from the current state; `feed` must have been called first."""
         logits = self._logits()
         stop = set(stop_ids or self.spec.eos_token_ids)
         rng = np.random.default_rng(seed)

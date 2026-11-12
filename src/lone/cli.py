@@ -181,8 +181,10 @@ def inspect_cmd(bundle: str = typer.Option(..., "--bundle")) -> None:
     print(f"  head: {len(manifest['head']['chunks'])} chunks")
 
 
+from .repl import register_chat  # noqa: E402  (needs `app` above)
 from .verify import register_verify  # noqa: E402  (needs `app` above)
 
+register_chat(app)
 register_verify(app)
 
 
