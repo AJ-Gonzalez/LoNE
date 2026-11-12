@@ -45,9 +45,10 @@ lone verify --bundle bundles/lfm3-1.7b --model /path/to/LFM3-1.7B \
     --prompt "Explain in one sentence why the sky is blue."
 ```
 
-Convert flags: `--precision fp16|lut4|lut6|lut8`, `--layers-per-model 1`, `--head-chunks 8`,
-`--decode-only`/`--prefill-only`, `--no-plan`. Weights are stored once per sequence shape, so a
-full bundle is ~2x the fp16 checkpoint; `--decode-only` halves it.
+Convert flags: `--precision fp16|lut4|lut6|lut8`, `--layers-per-model 4`, `--head-chunks` (0 sizes
+each head graph to ~128 MB of weights), `--decode-only`/`--prefill-only`, `--no-plan`. Weights are
+stored once per sequence shape, so a full bundle is ~2x the fp16 checkpoint; `--decode-only` halves
+it.
 
 `lone verify` runs the HF checkpoint in a subprocess, then the bundle's decode path in the parent;
 it prints logits cosine, argmax, the per-layer hidden drift and (with `--max-new-tokens`) the first
@@ -77,18 +78,24 @@ One request at a time; Core ML serialises predictions anyway. `--cpu-only` and
 
 ## Precision rules
 
-The ANE's arithmetic differs from torch's fp16 in four measurable ways; `torch_model` implements
-all four and `lone verify` exists because per-op conversion parity does not catch them.
+The ANE's arithmetic differs from torch's fp16 in three measurable ways; `torch_model` implements
+all three and `lone verify` exists because per-op conversion parity does not catch them.
 
 | Rule | Why (measured) |
 |---|---|
-| **1 layer per graph** | 1 layer → 0.99986 logits cosine; 2 → 0.9968; 4 → 0.9969 on 230M |
 | **Wide reductions split** (FFN > 4096, head hidden > 1024) | one 6656-wide projection 0.9972; two 3328-wide 0.999994 |
 | **Wide reductions scaled by 2^4** (any k > 1024; weights ×16, output ×1/16) | products otherwise fall subnormal: LFM3 conv `out_proj` 0.99916 → 0.9999998 |
 | **SiLU as `x / (1 + exp(-x))`** | Core ML's fused `silu`/`sigmoid` is an NE approximation ~1e-3 off; gate 0.99935 → 0.999991 |
 
 Power-of-two scaling is exact in fp16 unless it overflows; 2^4 stays far below the fp16 maximum.
 Norm reductions need none of this — `mean` over 2048 measured exact on the ANE.
+
+Chunk size is **not** a precision knob once the rules above are in place: 230M measures 0.99981
+(1 layer per graph), 0.99976 (2) and 0.99990 (4) at ctx 128, and LFM3-1.7B measures 0.99977 at 4
+layers per graph with argmax match. The earlier 0.9968 / 0.9969 readings at 2 and 4 layers predate
+the scaled reductions and exact SiLU. Fewer, larger graphs are also cheaper: each graph pays a
+start-up ramp, worth 1.58× on 230M (17.6 → 11.1 ms/token) and inside noise on LFM3, whose weights
+dominate. `--layers-per-model 4` is the default and `lone verify` is the gate for any change.
 
 ## Measured (M1, 8 GB)
 
@@ -173,3 +180,8 @@ The stack is split into contiguous chunks, one `mlprogram` per sequence shape
 and the `conv_kernel-1` window per conv layer — concatenated as `past || new` inside the graph with
 an additive mask keyed by absolute position. No Core ML state buffers, so the conversion path stays
 on TorchScript. The LM head is vocabulary slices on the ANE; the embedding gather runs on the CPU.
+
+## Notes and unverified ideas
+
+External suggestions not yet measured — LUT4 + pruning + retraining, and emitting the MIL graph
+directly in Swift: [`docs/notes.md`](docs/notes.md).

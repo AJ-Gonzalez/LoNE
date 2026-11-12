@@ -36,6 +36,22 @@ TOKENIZER_FILES = (
     "generation_config.json",
 )
 
+# One head graph re-reads its vocabulary slice every token. The ANE sustains ~49 GB/s on a ~130 MB
+# read and ~34 GB/s on a 17 MB one (measured, README), so slices are sized by bytes, not by count.
+HEAD_GRAPH_BYTES = 128 * 1024 * 1024
+_BITS_PER_WEIGHT = {"fp16": 16, "lut8": 8, "lut6": 6, "lut4": 4}
+
+
+def head_chunk_count(vocab: int, hidden: int, precision: str = "fp16",
+                     budget_bytes: int = HEAD_GRAPH_BYTES) -> int:
+    """Number of vocabulary slices, so one head graph's weights fit `budget_bytes`."""
+    if vocab <= 0 or hidden <= 0:
+        raise ValueError("vocab and hidden must be positive")
+    row_bytes = max(1, hidden * _BITS_PER_WEIGHT.get(precision, 16) // 8)
+    rows = max(1, budget_bytes // row_bytes)
+    return max(1, math.ceil(vocab / rows))
+
+
 # HF parameter names -> the short keys the static modules use.
 _ATTN_KEYS = ("q_proj", "k_proj", "v_proj", "o_proj")
 
@@ -171,9 +187,9 @@ def convert_model(
     out_dir: str,
     ctx: int = 2048,
     prefill: int = 64,
-    layers_per_model: int = 1,
+    layers_per_model: int = 4,
     precision: str = "fp16",
-    head_chunks: int = 8,
+    head_chunks: int = 0,
     decode_only: bool = False,
     prefill_only: bool = False,
     check_plan: bool = True,
@@ -238,6 +254,7 @@ def convert_model(
         embed = sd.get_tensor("model.embed_tokens.weight").to(torch.float16)
         norm = sd.get_tensor("model.embedding_norm.weight").to(torch.float16)
         vocab = spec.vocab_size
+        head_chunks = max(1, head_chunks or head_chunk_count(vocab, spec.hidden_size, precision))
         step = math.ceil(vocab / head_chunks)
         head_meta = []
         for j, start in enumerate(range(0, vocab, step)):

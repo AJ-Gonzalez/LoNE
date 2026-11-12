@@ -40,10 +40,12 @@ def convert(
     ctx: int = typer.Option(2048, "--ctx"),
     prefill: int = typer.Option(64, "--prefill"),
     layers_per_model: int = typer.Option(
-        1, "--layers-per-model", help="decoder layers per Core ML graph; 1 is the most accurate on ANE"
+        4, "--layers-per-model", help="decoder layers per Core ML graph; fewer graphs are faster, 4 verifies at parity"
     ),
     precision: Precision = typer.Option(Precision.fp16, "--precision"),
-    head_chunks: int = typer.Option(8, "--head-chunks"),
+    head_chunks: int = typer.Option(
+        0, "--head-chunks", help="vocabulary slices for the LM head; 0 sizes each graph to ~128 MB"
+    ),
     decode_only: bool = typer.Option(False, "--decode-only", help="skip the prefill models (slower prompts)"),
     prefill_only: bool = typer.Option(False, "--prefill-only", help="skip the decode models (prefill timing only)"),
     plan: bool = typer.Option(True, "--plan/--no-plan", help="report the MLComputePlan placement per model"),
