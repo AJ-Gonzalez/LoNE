@@ -342,26 +342,67 @@ class LoneModel:
         return out
 
 
+# Ranks past this can only be sampled when the distribution is flat enough that top-p keeps most
+# of the vocabulary; the prefilter detects that and falls back to the full vector.
+_SAMPLE_CANDIDATES = 1024
+
+
 def sample(logits: np.ndarray, temperature: float = 0.0, top_p: float = 1.0, top_k: int = 0,
            rng: np.random.Generator | None = None) -> int:
+    """Draw one token. Greedy at temperature 0; otherwise softmax over the sampled support.
+
+    Sorting the whole vocabulary per token cost 9 ms at 128k, but only the head of the
+    distribution can ever be drawn: `top_k` is a hard cut and `top_p < 1` keeps a few hundred
+    ranks in practice. The support is found by `argpartition` and only that slice is sorted. The
+    probabilities passed to `rng.choice` are the true ones (divided by the full-vocabulary mass),
+    so the kept set matches the vocabulary-wide computation; when top-p would reach beyond the
+    slice, the full vector is used instead.
+    """
     if temperature <= 0:
         return int(np.argmax(logits))
-    logits = logits.astype(np.float64) / float(temperature)
-    if top_k and top_k < logits.size:
-        cut = np.partition(logits, -top_k)[-top_k]
-        logits = np.where(logits < cut, -np.inf, logits)
-    if top_p < 1.0:
-        order = np.argsort(-logits)
-        probs = _softmax(logits[order])
-        cumulative = np.cumsum(probs)
-        keep = cumulative <= top_p
-        keep[0] = True
-        kept = order[keep]
-        probs = probs[keep]
-        probs = probs / probs.sum()
-        return int(rng.choice(kept, p=probs))
-    probs = _softmax(logits)
-    return int(rng.choice(logits.size, p=probs))
+    if rng is None:
+        rng = np.random.default_rng()
+
+    x = logits / np.float32(temperature)
+    size = x.size
+
+    if top_k and top_k < size:
+        # Keep every token tied at the cut, as a vocabulary-wide mask does.
+        cut = np.partition(x, -top_k)[-top_k]
+        cand = np.flatnonzero(x >= cut)
+        order = np.argsort(-x[cand])
+        kept, probs = _top_p(_softmax(x[cand][order].astype(np.float64)), top_p)
+        return int(rng.choice(cand[order[kept]], p=probs))
+
+    if top_p < 1.0 and size > _SAMPLE_CANDIDATES:
+        e = np.exp(x.astype(np.float64) - float(x.max()))
+        total = e.sum()
+        cand = np.argpartition(e, -_SAMPLE_CANDIDATES)[-_SAMPLE_CANDIDATES:]
+        probs = e[cand] / total
+        order = np.argsort(-probs)
+        kept, normalised = _top_p(probs[order], top_p)
+        if kept.size < order.size:
+            return int(rng.choice(cand[order[kept]], p=normalised))
+        # Top-p needs ranks outside the slice: the full distribution is already exponentiated.
+        probs = e / total
+    else:
+        probs = _softmax(x.astype(np.float64))
+
+    if top_p >= 1.0:
+        return int(rng.choice(size, p=probs))
+    order = np.argsort(-probs)
+    kept, normalised = _top_p(probs[order], top_p)
+    return int(rng.choice(order[kept], p=normalised))
+
+
+def _top_p(sorted_probs: np.ndarray, top_p: float) -> tuple[np.ndarray, np.ndarray]:
+    """Indices and renormalised probabilities of the top-p set of `sorted_probs` (descending)."""
+    if top_p >= 1.0:
+        return np.arange(sorted_probs.size), sorted_probs
+    keep = np.cumsum(sorted_probs) <= top_p
+    keep[0] = True
+    probs = sorted_probs[keep]
+    return np.flatnonzero(keep), probs / probs.sum()
 
 
 def _softmax(x: np.ndarray) -> np.ndarray:
