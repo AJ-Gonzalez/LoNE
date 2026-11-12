@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import ModelSpec
-from .layout import chunk_layout
+from .layout import cache_len_for, chunk_layout
 
 
 def rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -52,10 +52,10 @@ def rotate_half(x: torch.Tensor, half: int) -> torch.Tensor:
 
 
 class AttentionLayer(nn.Module):
-    def __init__(self, spec: ModelSpec, params: dict, seq: int, ctx: int, kind: str):
+    def __init__(self, spec: ModelSpec, params: dict, seq: int, cache_len: int, kind: str):
         super().__init__()
         self.seq = seq
-        self.ctx = ctx
+        self.cache_len = cache_len
         self.heads = spec.num_heads
         self.kv = spec.num_kv_heads
         self.hd = spec.head_dim
@@ -88,7 +88,7 @@ class AttentionLayer(nn.Module):
 
         keys = torch.cat((k_past, k), dim=2)
         vals = torch.cat((v_past, v), dim=2)
-        total = self.ctx + self.seq
+        total = self.cache_len + self.seq
         keys = keys[:, :, None].expand(1, self.kv, self.groups, total, self.hd).reshape(
             1, self.kv * self.groups, total, self.hd
         )
@@ -125,13 +125,13 @@ class ConvLayer(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, spec: ModelSpec, params: dict, seq: int, ctx: int, kind: str):
+    def __init__(self, spec: ModelSpec, params: dict, seq: int, cache_len: int, kind: str):
         super().__init__()
         self.eps = spec.norm_eps
         self.kind = kind
         self.is_attention = kind != "conv"
         if self.is_attention:
-            self.op = AttentionLayer(spec, params, seq, ctx, kind)
+            self.op = AttentionLayer(spec, params, seq, cache_len, kind)
         else:
             self.op = ConvLayer(spec, params, seq)
 
@@ -181,14 +181,17 @@ class DecoderLayer(nn.Module):
 class Chunk(nn.Module):
     """A contiguous group of decoder layers with explicit cache tensors."""
 
-    def __init__(self, spec: ModelSpec, params_by_layer: dict, layer_ids: list[int], seq: int, ctx: int):
+    def __init__(self, spec: ModelSpec, params_by_layer: dict, layer_ids: list[int], seq: int, ctx: int,
+                 ring: bool = False):
         super().__init__()
         self.layout = chunk_layout(spec, layer_ids)
         self.input_names = self.layout["inputs"]
         self.output_names = self.layout["outputs"]
         self.kinds = {i: spec.kind(i) for i in layer_ids}
         self.layers = nn.ModuleDict(
-            {str(i): DecoderLayer(spec, params_by_layer[i], seq, ctx, spec.kind(i)) for i in layer_ids}
+            {str(i): DecoderLayer(spec, params_by_layer[i], seq,
+                                  cache_len_for(spec, spec.kind(i), ctx, ring), spec.kind(i))
+             for i in layer_ids}
         )
         self.layer_ids = list(layer_ids)
 
@@ -236,15 +239,17 @@ class Head(nn.Module):
         return F.linear(h, self.wa) * self.a_inv
 
 
-def example_inputs(spec: ModelSpec, layout: dict, seq: int, ctx: int, dtype=torch.float16) -> dict:
+def example_inputs(spec: ModelSpec, layout: dict, seq: int, ctx: int, dtype=torch.float16,
+                   ring: bool = False) -> dict:
     shapes = {"hidden": (1, seq, spec.hidden_size)}
     for kind in layout["attention_kinds"]:
         shapes[f"cos_{kind}"] = (1, seq, spec.head_dim)
         shapes[f"sin_{kind}"] = (1, seq, spec.head_dim)
-        shapes[f"mask_{kind}"] = (1, 1, seq, ctx + seq)
+        shapes[f"mask_{kind}"] = (1, 1, seq, cache_len_for(spec, kind, ctx, ring) + seq)
     for i in layout["attention_layers"]:
-        shapes[f"k_{i}"] = (1, spec.num_kv_heads, ctx, spec.head_dim)
-        shapes[f"v_{i}"] = (1, spec.num_kv_heads, ctx, spec.head_dim)
+        n = cache_len_for(spec, spec.kind(i), ctx, ring)
+        shapes[f"k_{i}"] = (1, spec.num_kv_heads, n, spec.head_dim)
+        shapes[f"v_{i}"] = (1, spec.num_kv_heads, n, spec.head_dim)
     for i in layout["conv_layers"]:
         shapes[f"conv_{i}"] = (1, spec.hidden_size, spec.conv_kernel - 1)
     return {name: torch.zeros(shape, dtype=dtype) for name, shape in shapes.items()}

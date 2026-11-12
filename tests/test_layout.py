@@ -131,3 +131,56 @@ def test_cos_sin_zero_tail():
     # `cat(freqs, freqs)`, so the zero-frequency slot repeats at index 1 and 3 for head_dim 4.
     assert np.allclose(cos[0, :, [1, 3]], 1.0)  # zero frequencies are unrotated
     assert np.allclose(sin[0, :, [1, 3]], 0.0)
+
+
+def _ring_positions(pos: int, n: int) -> np.ndarray:
+    if pos == 0:
+        return np.full(n, -1)
+    rows = np.arange(n)
+    return pos - 1 - ((pos - 1 - rows) % n)
+
+
+@pytest.mark.parametrize("seq", [1, 3])
+def test_ring_mask_matches_absolute_positions(seq):
+    window = 4
+    for pos in range(0, 13):
+        mask = attention_mask("sliding_attention", ctx=window, seq=seq, pos=pos, window=window, ring=True)
+        allowed = mask[0, 0] == 0
+        past = _ring_positions(pos, window)
+        pairs = set()
+        for qi, qabs in enumerate(pos + np.arange(seq)):
+            for r in range(window):
+                if allowed[qi, r] and past[r] >= 0:
+                    pairs.add((int(qabs), int(past[r])))
+            for j in range(seq):
+                if allowed[qi, window + j]:
+                    pairs.add((int(qabs), pos + j))
+        expected = {(int(q), p) for q in pos + np.arange(seq)
+                    for p in range(max(0, q - window + 1), q + 1)}
+        assert pairs == expected, (pos, seq)
+
+
+def test_ring_mask_wraps_a_full_attention_cache():
+    mask = attention_mask("full_attention", ctx=4, seq=1, pos=6, ring=True)[0, 0, 0]
+    assert list(np.where(mask == 0)[0]) == [0, 1, 2, 3, 4]
+    # next write is row 2, so rows 0-1 hold the newest positions and 2-3 the oldest
+    assert _ring_positions(6, 4).tolist() == [4, 5, 2, 3]
+
+
+def test_ring_mask_equals_the_absolute_mask_before_wrapping():
+    for pos in range(0, 6):
+        for seq in (1, 2):
+            if pos + seq > 8:
+                continue
+            a = attention_mask("sliding_attention", ctx=8, seq=seq, pos=pos, window=8, ring=False)
+            b = attention_mask("sliding_attention", ctx=8, seq=seq, pos=pos, window=8, ring=True)
+            assert np.array_equal(a, b), (pos, seq)
+
+
+def test_sliding_layers_get_a_window_sized_cache(tmp_path):
+    from lone.layout import cache_lengths
+
+    spec = ModelSpec.from_dir(write_model(tmp_path, LFM3))
+    assert cache_lengths(spec, 512) == {"full_attention": 512, "sliding_attention": 256}
+    assert cache_lengths(spec, 512, ring=False) == {"full_attention": 512, "sliding_attention": 512}
+    assert cache_lengths(spec, 128) == {"full_attention": 128, "sliding_attention": 128}

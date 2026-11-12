@@ -46,6 +46,10 @@ def convert(
     head_chunks: int = typer.Option(
         0, "--head-chunks", help="vocabulary slices for the LM head; 0 sizes each graph to ~128 MB"
     ),
+    ring: bool = typer.Option(
+        True, "--ring/--no-ring",
+        help="ring-buffer sliding layers to their window instead of the full ctx (default on)",
+    ),
     decode_only: bool = typer.Option(False, "--decode-only", help="skip the prefill models (slower prompts)"),
     prefill_only: bool = typer.Option(False, "--prefill-only", help="skip the decode models (prefill timing only)"),
     plan: bool = typer.Option(True, "--plan/--no-plan", help="report the MLComputePlan placement per model"),
@@ -61,6 +65,7 @@ def convert(
         layers_per_model=layers_per_model,
         precision=precision.value,
         head_chunks=head_chunks,
+        ring=ring,
         decode_only=decode_only,
         prefill_only=prefill_only,
         check_plan=plan,
@@ -165,6 +170,9 @@ def inspect_cmd(bundle: str = typer.Option(..., "--bundle")) -> None:
           f"conv {spec['conv_kernel']}, vocab {spec['vocab_size']}")
     print(f"shapes: ctx {manifest['shapes']['ctx']}, prefill {manifest['shapes']['prefill']}, "
           f"precision {manifest['precision']}")
+    window = spec.get("sliding_window")
+    if manifest.get("ring") and window:
+        print(f"ring: sliding cache {min(window, manifest['shapes']['ctx'])} rows (window {window})")
     for chunk in manifest["chunks"]:
         tail = ", ".join(
             f"{tag}: {meta.get('plan', {}).get('devices', 'n/a')}" for tag, meta in chunk["models"].items()

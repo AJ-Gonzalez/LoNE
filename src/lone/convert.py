@@ -190,6 +190,7 @@ def convert_model(
     layers_per_model: int = 4,
     precision: str = "fp16",
     head_chunks: int = 0,
+    ring: bool = True,
     decode_only: bool = False,
     prefill_only: bool = False,
     check_plan: bool = True,
@@ -234,8 +235,8 @@ def convert_model(
             entries = {"name": f"chunk_{gi}", "layers": layer_ids, "models": {}}
 
             for tag, seq in seqs:
-                module = Chunk(spec, params, layer_ids, seq, ctx)
-                example = example_inputs(spec, layout, seq, ctx)
+                module = Chunk(spec, params, layer_ids, seq, ctx, ring)
+                example = example_inputs(spec, layout, seq, ctx, ring=ring)
                 name = f"chunk_{gi}_{tag}"
                 path = _trace_and_convert(module, layout["inputs"], layout["outputs"], example, name,
                                           chunk_dir, precision)
@@ -280,6 +281,7 @@ def convert_model(
         "source": {"model_dir": os.path.abspath(model_dir)},
         "spec": spec.to_dict(),
         "shapes": {"ctx": ctx, "prefill": prefill, "decode": 1},
+        "ring": ring,
         "precision": precision,
         "chunks": chunks_meta,
         "head": {"chunks": head_meta, "vocab": vocab},

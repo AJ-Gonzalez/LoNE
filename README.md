@@ -46,9 +46,9 @@ lone verify --bundle bundles/lfm3-1.7b --model /path/to/LFM3-1.7B \
 ```
 
 Convert flags: `--precision fp16|lut4|lut6|lut8`, `--layers-per-model 4`, `--head-chunks` (0 sizes
-each head graph to ~128 MB of weights), `--decode-only`/`--prefill-only`, `--no-plan`. Weights are
-stored once per sequence shape, so a full bundle is ~2x the fp16 checkpoint; `--decode-only` halves
-it.
+each head graph to ~128 MB of weights), `--decode-only`/`--prefill-only`, `--ring/--no-ring`, `--no-plan`. Weights are stored once per
+sequence shape, so a full bundle is ~2x the fp16 checkpoint; `--decode-only` halves it. `--no-ring`
+keeps a full-`ctx` cache for sliding layers instead of a window-sized ring.
 
 `lone verify` runs the HF checkpoint in a subprocess, then the bundle's decode path in the parent;
 it prints logits cosine, argmax, the per-layer hidden drift and (with `--max-new-tokens`) the first
@@ -180,6 +180,11 @@ The stack is split into contiguous chunks, one `mlprogram` per sequence shape
 and the `conv_kernel-1` window per conv layer — concatenated as `past || new` inside the graph with
 an additive mask keyed by absolute position. No Core ML state buffers, so the conversion path stays
 on TorchScript. The LM head is vocabulary slices on the ANE; the embedding gather runs on the CPU.
+
+Sliding layers keep a **ring buffer** sized to their window (256 for LFM3) instead of `ctx`: row
+`p % window` holds absolute position `p`, the runtime writes new keys there, and the mask resolves
+rows back to positions, so the graph reads 256 keys where it used to read `ctx`. It is the same
+attention, only the buffer rotation changes; `--no-ring` restores the full-`ctx` cache.
 
 ## Notes and unverified ideas
 

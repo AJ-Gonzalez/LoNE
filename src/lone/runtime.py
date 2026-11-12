@@ -11,7 +11,7 @@ import numpy as np
 from jinja2.ext import Extension
 
 from .config import ModelSpec
-from .layout import attention_mask, chunk_layout, cos_sin
+from .layout import attention_mask, cache_lengths, chunk_layout, cos_sin
 
 _COMPUTE_UNITS = {
     "cpu_and_ne": "CPU_AND_NE",
@@ -181,6 +181,8 @@ class LoneModel:
         self._embed = np.load(os.path.join(bundle_dir, emb["file"]), mmap_mode="r")
         self._tok = BundleTokenizer(os.path.join(bundle_dir, self.manifest["tokenizer"]["dir"]))
 
+        self._ring = bool(self.manifest.get("ring", False))
+        self._cache_len = cache_lengths(self.spec, self.ctx, self._ring)
         self._inv = {kind: _inv_freq(self.spec, kind) for kind in self.spec.rope}
         self._cache_dtype = np.float16
         self._wire_caches = bool(wire_caches)
@@ -206,7 +208,10 @@ class LoneModel:
         allocating = not hasattr(self, "_k")
         if allocating:
             self._k = {
-                i: np.zeros((1, self.spec.num_kv_heads, self.ctx, self.spec.head_dim), dtype=self._cache_dtype)
+                i: np.zeros(
+                    (1, self.spec.num_kv_heads, self._cache_len[self.spec.kind(i)], self.spec.head_dim),
+                    dtype=self._cache_dtype,
+                )
                 for i in range(self.spec.num_layers)
                 if self.spec.is_attention(i)
             }
@@ -230,7 +235,8 @@ class LoneModel:
         return cos_sin(self._inv[kind], positions)
 
     def _mask(self, kind: str, seq: int, pos: int) -> np.ndarray:
-        return attention_mask(kind, self.ctx, seq, pos, self.spec.sliding_window)
+        return attention_mask(kind, self._cache_len[kind], seq, pos, self.spec.sliding_window,
+                              ring=self._ring)
 
     def _embed_tokens(self, ids: list[int]) -> np.ndarray:
         rows = np.asarray(ids, dtype=np.int64)
@@ -259,13 +265,26 @@ class LoneModel:
 
         out = model.predict(feed)
         for i in layout["attention_layers"]:
-            self._k[i][0, :, pos : pos + seq, :] = out[f"k_{i}_out"][0].astype(np.float16)
-            self._v[i][0, :, pos : pos + seq, :] = out[f"v_{i}_out"][0].astype(np.float16)
+            self._store(self._k, i, out[f"k_{i}_out"][0], pos, seq)
+            self._store(self._v, i, out[f"v_{i}_out"][0], pos, seq)
         for i in layout["conv_layers"]:
             # In place: the conv window keeps its address, so it stays wired and does not
             # allocate once per token.
             self._conv[i][...] = out[f"conv_{i}_out"]
         self._hidden = out["hidden_out"].astype(np.float16)
+
+    @staticmethod
+    def _store(cache: dict, i: int, new: np.ndarray, pos: int, seq: int) -> None:
+        """Write the new rows at their absolute positions, wrapping when the cache is a ring.
+
+        For a full-attention cache the modulus is the identity (`pos + seq <= ctx`), so one path
+        covers both; a prefill longer than the window keeps only the last `cache rows`.
+        """
+        n = cache[i].shape[2]
+        if seq > n:
+            new, pos = new[:, -n:, :], pos + seq - n
+        index = (pos + np.arange(new.shape[1])) % n
+        cache[i][0][:, index, :] = new.astype(np.float16)
 
     def _forward(self, ids: list[int], tag: str, capture: list | None = None) -> None:
         seq = len(ids)
