@@ -1,0 +1,35 @@
+name: publish
+
+# Trusted publishing: no API token exists anywhere. PyPI verifies this workflow's OIDC identity
+# against the pending/trusted publisher registered for the project
+# (AJ-Gonzalez/LoNE, workflow publish.yml, environment pypi).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # the OIDC token PyPI exchanges for a short-lived upload token
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Tag matches the packaged version
+        run: |
+          version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/lone/__init__.py)
+          echo "package $version, tag ${GITHUB_REF_NAME}"
+          if [ "v$version" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match v$version"
+            exit 1
+          fi
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Upload to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
