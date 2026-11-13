@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lone-ane"
-version = "0.0.1"
+dynamic = ["version"]
 description = "LFM3 / LFM2.5 on the Apple Neural Engine"
 readme = "README.md"
 license = "Apache-2.0"
@@ -46,5 +46,11 @@ Issues = "https://github.com/AJ-Gonzalez/LoNE/issues"
 [project.scripts]
 lone = "lone.cli:main"
 
+[tool.hatch.version]
+path = "src/lone/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/lone"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/lone", "tests", "bench", "README.md", "CHANGELOG.md", "LICENSE", "pyproject.toml"]
