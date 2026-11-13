@@ -14,6 +14,7 @@ import queue
 import threading
 import time
 
+from . import __version__
 from .metrics import ANECounters
 from .runtime import LoneModel
 
@@ -42,7 +43,7 @@ def create_app(bundle_dir: str, compute_units: str = "cpu_and_ne", wire_caches: 
         "decode_seconds": 0.0,
         "last": None,
     }
-    app = FastAPI(title="LoNE", version="0.0.1")
+    app = FastAPI(title="LoNE", version=__version__)
     app.state.wired_bytes = model.wired_bytes
 
     def _params(body: dict) -> dict:

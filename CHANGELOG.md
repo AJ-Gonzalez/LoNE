@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+- README: PyPI badge and links, and the name mapping stated plainly — the distribution is
+  `lone-ane` on PyPI, the command it installs is `lone`. The Homebrew section no longer names a
+  stale source tag.
+- `lone serve` advertises the package version in `/v1/models` and the OpenAPI schema instead of a
+  hardcoded `0.0.1`.
+
 ## 0.1.0
 
 N-gram speculative decoding, and two fixes it exposed.

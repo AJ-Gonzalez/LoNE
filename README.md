@@ -1,12 +1,17 @@
 # LoNE: Liquid on Neural Engine
 
+[![PyPI](https://img.shields.io/pypi/v/lone-ane.svg)](https://pypi.org/project/lone-ane/)
+[![Python](https://img.shields.io/pypi/pyversions/lone-ane.svg)](https://pypi.org/project/lone-ane/)
+[![License](https://img.shields.io/pypi/l/lone-ane.svg)](https://github.com/AJ-Gonzalez/LoNE/blob/main/LICENSE)
+
 LFM3 and LFM2.5 on the Apple Neural Engine, via Core ML. Decode is bandwidth-bound on the ANE, so
 LoNE targets MLX-class throughput at a lower power envelope; it also works around the ANE's fp16
 arithmetic failures, which are the precision rules below.
 
 ## Install
 
-Apple Silicon, macOS 15+, Python 3.11+.
+Apple Silicon, macOS 15+, Python 3.11+. The distribution is **`lone-ane`** on
+[PyPI](https://pypi.org/project/lone-ane/); it installs the **`lone`** command.
 
 ```bash
 pip install lone-ane                  # run / serve / chat
@@ -27,8 +32,8 @@ brew trust aj-gonzalez/lone
 brew install lone-ane
 ```
 
-Builds the `v0.0.1` source tag into an isolated Python 3.12 venv with runtime dependencies from
-PyPI. Conversion extras are opt-in:
+Builds the released source tag (`v0.1.1`) into an isolated Python 3.12 venv with runtime
+dependencies from PyPI. Conversion extras are opt-in:
 
 ```bash
 "$(brew --prefix lone-ane)/libexec/bin/pip" install "torch==2.7.0" "scikit-learn>=1.4,<1.6" "transformers>=5.0"
