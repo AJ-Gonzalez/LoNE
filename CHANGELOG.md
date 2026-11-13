@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **`lone harness`.** One turn of a [Diverge](https://github.com/divergenetwork/Diverge)
+  agentic loop: one JSON feed on stdin (`input`, `tools`, `resources`), one envelope on the last
+  line of stdout (`{"eval": <chunks>, "stdout": ""}`). The stored history is rendered through the
+  bundle's chat template — tool calls coalesced by id, tool responses as `tool` messages — and the
+  generated turn is split into reasoning, text and tool calls. Both LFM tool-call grammars are
+  parsed back. macOS-only, like the rest of LoNE.
+
 ## 0.1.1
 
 - README: PyPI badge and links, and the name mapping stated plainly — the distribution is

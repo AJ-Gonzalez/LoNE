@@ -1,4 +1,4 @@
-"""`lone` command line: convert, run, serve, inspect, verify.
+"""`lone` command line: convert, run, serve, chat, harness, inspect, verify.
 
 Typer wraps the same core functions; option names and defaults are unchanged from the argparse
 version. `main()` is kept as the console-script target.
@@ -163,6 +163,43 @@ def run(
                 f" in {stats.get('passes', 0)} passes")
     print(f"\n[{len(ids)} tokens | {rate:.1f} tok/s | first token {prefill_s * 1e3:.0f} ms | "
           f"{len(prompt_ids)} prompt tokens{spec}]", file=sys.stderr)
+
+
+@app.command(help="one turn of a Diverge agentic loop, fed on stdin")
+def harness(
+    bundle: str = typer.Option(..., "--bundle"),
+    system: str | None = typer.Option(None, "--system"),
+    max_new_tokens: int = typer.Option(512, "--max-new-tokens"),
+    temperature: float = typer.Option(0.0, "--temperature"),
+    top_p: float = typer.Option(1.0, "--top-p"),
+    top_k: int = typer.Option(0, "--top-k"),
+    seed: int | None = typer.Option(None, "--seed"),
+    thinking: bool = typer.Option(True, "--thinking/--no-thinking"),
+    cpu_only: bool = typer.Option(False, "--cpu-only"),
+    compute_units: ComputeUnits = typer.Option(ComputeUnits.cpu_and_ne, "--compute-units"),
+    wire_caches: bool = typer.Option(
+        False, "--wire-caches", help="wire the KV and conv caches with mlock so they cannot be paged out (macOS)"
+    ),
+) -> None:
+    from .harness import envelope, load_feed, run
+
+    feed = load_feed(sys.stdin.read())
+    turn = run(
+        feed,
+        bundle,
+        system=system,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        seed=seed,
+        thinking=thinking,
+        compute_units=_units(cpu_only, compute_units),
+        wire_caches=wire_caches,
+    )
+    sys.stdout.write(envelope(turn) + "\n")
+    sys.stdout.flush()
+    os._exit(0)
 
 
 @app.command(help="OpenAI-compatible HTTP server")

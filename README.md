@@ -155,6 +155,36 @@ One request at a time; Core ML serialises predictions anyway. `--cpu-only` and
 `--compute-units {cpu_and_ne,cpu_and_gpu,cpu_only,all}` select the engine. Point EvalPlus
 (`--backend openai`), lm-eval (`local-chat-completions`) or Harbor at the OpenAI endpoint.
 
+## Harness
+
+`lone harness` is one turn of a [Diverge](https://github.com/divergenetwork/Diverge) agentic
+loop, in the shape `diverge-agents/python/HARNESS.md` settles: a container's Rust loop spawns it
+once per turn and reads one JSON envelope back.
+
+```bash
+printf '%s' '{"input":[[{"type":"text","text":"Say hi."}]],"tools":[],"resources":[]}' \
+  | lone harness --bundle bundles/lfm3-1.7b --max-new-tokens 128
+{"eval": [{"type": "assistant_text_content", "text": "Hello!"}], "stdout": ""}
+```
+
+- **stdin** is one object. `input` is the stored history — chunk objects, and each user message as
+  an array of MCP content blocks, newest last; `tools` and `resources` are the MCP listings for
+  this turn. Nothing is converted for the model except what the chat template needs.
+- **stdout** ends with the envelope; nothing else is written there. `eval` is the turn's chunks —
+  `assistant_reasoning`, `assistant_text_content`, `assistant_tool_call` — and `stdout` is empty:
+  the model's prints are the process's, and its diagnostics go to stderr.
+- The history is replayed through the bundle's own chat template: tool calls coalesce by id, a
+  `tool_response` is a `tool` message, and both LFM tool-call grammars
+  (`<tool_call><function=…>` and `<|tool_call_start|>[name(k='v')]<|tool_call_end|>`) are parsed
+  back into `assistant_tool_call` chunks with JSON-string arguments.
+- The process exits 0 after `os._exit` so nothing the bundle left behind can print after the
+  envelope. A bundle that cannot answer exits non-zero with the reason on stderr, which the loop
+  reports as the turn raising.
+
+The turn needs `prompt + 1` tokens of the bundle's context; `--max-new-tokens` is clamped to what
+is left. `--temperature`, `--top-p`, `--top-k`, `--seed`, `--thinking/--no-thinking`, `--system`
+and the engine flags are the same as `run`. macOS only, like everything else here.
+
 ## Precision rules
 
 The ANE's arithmetic differs from torch's fp16 in three measurable ways; `torch_model` implements
