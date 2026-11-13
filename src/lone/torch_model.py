@@ -121,7 +121,9 @@ class ConvLayer(nn.Module):
         w = self.kernel[:, :, None, :]  # (H, 1, 1, K)
         y = F.conv2d(h.unsqueeze(2), w, groups=self.hidden)[:, :, 0, :]  # (1, H, T)
         out = F.linear((c * y).transpose(1, 2).contiguous(), self.wout) * self.out_inv
-        return out, h[:, :, -self.state_len :]
+        # `h` is the window plus this pass's inputs, so a caller that rejects part of a multi-token
+        # pass (speculative verification) can rebuild the window for any prefix of it.
+        return out, h[:, :, -self.state_len :], h
 
 
 class DecoderLayer(nn.Module):
@@ -159,7 +161,7 @@ class DecoderLayer(nn.Module):
         if self.is_attention:
             h, new_k, new_v = self.op(h, *op_args)
         else:
-            h, new_state = self.op(h, *op_args)
+            h, new_state, window = self.op(h, *op_args)
         if self.post_op_norm is not None:
             h = rms(h, self.post_op_norm, self.eps)
         x = x + h
@@ -175,16 +177,16 @@ class DecoderLayer(nn.Module):
         if self.post_ffn_norm is not None:
             f = rms(f, self.post_ffn_norm, self.eps)
         x = x + f
-        return (x, new_k, new_v) if self.is_attention else (x, new_state)
+        return (x, new_k, new_v) if self.is_attention else (x, new_state, window)
 
 
 class Chunk(nn.Module):
     """A contiguous group of decoder layers with explicit cache tensors."""
 
     def __init__(self, spec: ModelSpec, params_by_layer: dict, layer_ids: list[int], seq: int, ctx: int,
-                 ring: bool = False):
+                 ring: bool = False, trace_conv: bool = False):
         super().__init__()
-        self.layout = chunk_layout(spec, layer_ids)
+        self.layout = chunk_layout(spec, layer_ids, trace_conv=trace_conv)
         self.input_names = self.layout["inputs"]
         self.output_names = self.layout["outputs"]
         self.kinds = {i: spec.kind(i) for i in layer_ids}
@@ -207,7 +209,9 @@ class Chunk(nn.Module):
                     x, d[f"cos_{kind}"], d[f"sin_{kind}"], d[f"mask_{kind}"], d[f"k_{i}"], d[f"v_{i}"]
                 )
             else:
-                x, out[f"conv_{i}_out"] = layer(x, d[f"conv_{i}"])
+                x, out[f"conv_{i}_out"], window = layer(x, d[f"conv_{i}"])
+                if self.layout["trace_conv"]:
+                    out[f"conv_{i}_window"] = window
         out["hidden_out"] = x
         return tuple(out[name] for name in self.output_names)
 

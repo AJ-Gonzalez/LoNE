@@ -52,6 +52,11 @@ def convert(
     ),
     decode_only: bool = typer.Option(False, "--decode-only", help="skip the prefill models (slower prompts)"),
     prefill_only: bool = typer.Option(False, "--prefill-only", help="skip the decode models (prefill timing only)"),
+    spec_drafts: int = typer.Option(
+        0, "--spec-drafts",
+        help="convert a verify shape for n-gram speculative decoding: prefill becomes drafts+1 and "
+             "the head is traced at that length (0 = off)",
+    ),
     plan: bool = typer.Option(True, "--plan/--no-plan", help="report the MLComputePlan placement per model"),
     compute_units: ComputeUnits = typer.Option(ComputeUnits.cpu_and_ne, "--compute-units"),
 ) -> None:
@@ -68,6 +73,7 @@ def convert(
         ring=ring,
         decode_only=decode_only,
         prefill_only=prefill_only,
+        spec_drafts=spec_drafts,
         check_plan=plan,
         compute_units=compute_units.value,
     )
@@ -90,8 +96,18 @@ def run(
     wire_caches: bool = typer.Option(
         False, "--wire-caches", help="wire the KV and conv caches with mlock so they cannot be paged out (macOS)"
     ),
+    spec_ngram: bool = typer.Option(
+        False, "--spec-ngram/--no-spec-ngram",
+        help="n-gram speculative decoding (llama.cpp ngram-simple); needs a bundle converted with --spec-drafts",
+    ),
+    spec_n: int = typer.Option(12, "--spec-n", help="lookup n-gram length for --spec-ngram"),
+    spec_m: int = typer.Option(16, "--spec-m", help="maximum draft length for --spec-ngram"),
+    spec_drafts: int = typer.Option(
+        0, "--spec-drafts", help="cap on verified drafts per step for --spec-ngram (0 = the bundle's)"
+    ),
 ) -> None:
     from .runtime import LoneModel
+    from .spec import NgramProposer
 
     model = LoneModel(bundle, _units(cpu_only, compute_units), wire_caches=wire_caches)
     if wire_caches:
@@ -116,6 +132,7 @@ def run(
             sys.stdout.write(model.tokenizer.decode([token]))
             sys.stdout.flush()
 
+    proposer = NgramProposer(spec_n, spec_m) if spec_ngram else None
     ids = model.generate(
         prompt_ids,
         max_new_tokens=max_new_tokens,
@@ -124,6 +141,8 @@ def run(
         top_k=top_k,
         seed=seed,
         on_token=on_token,
+        proposer=proposer,
+        max_drafts=spec_drafts,
     )
     wall = time.perf_counter() - started
     text = model.tokenizer.decode(ids)
@@ -135,8 +154,15 @@ def run(
     decode_s = max(wall - prefill_s, 1e-9)
     decode_tokens = max(len(ids) - 1, 0)
     rate = decode_tokens / decode_s if decode_tokens else 0.0
+    spec = ""
+    stats = model.spec_stats
+    if proposer is not None:
+        drafted = stats.get("drafted", 0)
+        hit = f" ({stats.get('accepted', 0) / drafted:.0%})" if drafted else ""
+        spec = (f" | spec {stats.get('accepted', 0)}/{drafted} drafts{hit}"
+                f" in {stats.get('passes', 0)} passes")
     print(f"\n[{len(ids)} tokens | {rate:.1f} tok/s | first token {prefill_s * 1e3:.0f} ms | "
-          f"{len(prompt_ids)} prompt tokens]", file=sys.stderr)
+          f"{len(prompt_ids)} prompt tokens{spec}]", file=sys.stderr)
 
 
 @app.command(help="OpenAI-compatible HTTP server")
@@ -170,6 +196,9 @@ def inspect_cmd(bundle: str = typer.Option(..., "--bundle")) -> None:
           f"conv {spec['conv_kernel']}, vocab {spec['vocab_size']}")
     print(f"shapes: ctx {manifest['shapes']['ctx']}, prefill {manifest['shapes']['prefill']}, "
           f"precision {manifest['precision']}")
+    drafts = manifest.get("speculative", {}).get("drafts", 0)
+    if drafts:
+        print(f"spec: n-gram verify shape, {drafts} drafts/pass, head {manifest['head'].get('seq')} rows")
     window = spec.get("sliding_window")
     if manifest.get("ring") and window:
         print(f"ring: sliding cache {min(window, manifest['shapes']['ctx'])} rows (window {window})")

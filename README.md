@@ -47,7 +47,8 @@ lone verify --bundle bundles/lfm3-1.7b --model /path/to/LFM3-1.7B \
 ```
 
 Convert flags: `--precision fp16|lut4|lut6|lut8`, `--layers-per-model 4`, `--head-chunks` (0 sizes
-each head graph to ~128 MB), `--decode-only`/`--prefill-only`, `--ring/--no-ring`, `--no-plan`.
+each head graph to ~128 MB), `--decode-only`/`--prefill-only`, `--ring/--no-ring`, `--no-plan`,
+`--spec-drafts N` (adds the verify shape; see below).
 Weights are stored once per sequence shape, so a full bundle is ~2x the fp16 checkpoint;
 `--decode-only` halves it. `--no-ring` keeps a full-`ctx` cache for sliding layers.
 
@@ -76,6 +77,51 @@ from the `PMP` group — cumulative, system-wide counters, so short turns are no
 read+write traffic. History is fed incrementally — each turn prefills only the tokens the template
 added — and `/reset` clears the conversation while keeping the weights loaded, which is the point of
 a REPL here: a fresh process re-specialises every graph (8 s measured for the 230M bundle).
+
+## Speculative decoding
+
+```bash
+lone convert --model /path/to/LFM3-1.7B --out bundles/lfm3-1.7b-spec \
+    --ctx 512 --precision lut8 --spec-drafts 16
+lone run --bundle bundles/lfm3-1.7b-spec --spec-ngram --max-new-tokens 128 --prompt "..."
+```
+
+Decode is bandwidth-bound here: one token re-reads the whole stack, so 16 tokens cost about the
+same as one when they go through a single graph. `--spec-drafts 16` converts that graph — the
+prefill shape becomes 17 tokens (one pending token plus 16 drafts) and the LM head is traced at the
+same length, so a verify pass returns one logits row per position from one weight read.
+
+The proposer is llama.cpp's `ngram-simple`, reimplemented verbatim (`src/lone/spec.py`): rescans the
+token history for the most recent earlier occurrence of the last `--spec-n` (12) tokens and drafts
+the following `--spec-m` (16) tokens, with llama.cpp's quirks — needs `n + m + 1` tokens of history,
+ignores a match at position 0, drops drafts shorter than `n`. It is a copy engine, so it only pays
+on repeated text (editing, refactoring, copying a file); on prose it drafts nothing and costs
+nothing.
+
+Acceptance is exact, not greedy-only: a draft token is accepted with the target's own probability
+for it and a rejected position draws from the target minus that token, so `--temperature`/`--top-k`/
+`--top-p` keep their distribution. At temperature 0 the accepted sequence is what plain greedy
+decode produces, except where the two graph shapes disagree on a near-tie: measured 0.9999 logits
+cosine between them, 96/96 identical tokens on a 230M copy test, 124/128 (96.9%) on the LUT8 1.7B.
+
+Measured (this M1, one process, both arms interleaved after a warmup; rates exclude prefill):
+
+| Bundle, engine | Workload | No spec | Spec | Acceptance | Tokens/pass |
+|---|---|---:|---:|---:|---:|
+| LFM2.5-230M fp16, ctx 256, 4 drafts, CPU | copy, temp 0 | 64.0 tok/s | 124.1 tok/s (1.94×) | 93.8% | 1.88 |
+| LFM3-1.7B LUT8 coder, ctx 512, 16 drafts, **NE** | repeat, temp 0 | 23.2 tok/s | **84.4 tok/s (3.64×)** | 91.1% | 5.08 |
+| same | copy (chat turn), temp 0.1 | 19.1 tok/s | 23.3 tok/s (1.22×) | 79.0% | 1.56 |
+| same | novel prose (control) | 22.8 tok/s | 24.0 tok/s (1.05×) | 43.8% | — |
+
+One verify pass costs 1.40 decode passes on the NE (1.45 on Metal), so break-even is 1.40
+tokens/pass and the speedup tracks how much verbatim text the model emits. On the ANE the repeat
+workload also drops from 64.8 to 23.2 mJ/token on the engine rail; a workload the proposer cannot
+exploit costs about 5%, and energy per token there was 63.0 → 60.5 mJ.
+
+Partial acceptance rewinds the caches to the accepted prefix. K/V rows are written at absolute
+positions and the mask admits nothing at or past `pos`, so stale rows are overwritten by the next
+pass; conv layers get their window from an extra graph output (`conv_<i>_window`, the previous
+window concatenated with this pass's inputs), which makes any prefix of the pass addressable.
 
 ## Serve
 
@@ -175,6 +221,9 @@ with CPU and DRAM. A wall/package figure needs `powermetrics` (root) or a meter.
   swap-bound `[INFERENCE]` — the longest measured run is a 401-token verification at ctx 512. `--wire-caches` (run, chat, serve) pins caches with `mlock(2)`
   so pressure evicts the mmap-backed weights instead.
 - **fp16 / palettized only.** No fp32 ANE path; palettized weights trade accuracy (above).
+- **Speculation stores a second copy of the weights.** `--spec-drafts N` sets the prefill shape to
+  N+1, and LoNE stores weights once per sequence shape, so the chunks double. A 1.7B LUT8 bundle
+  with a verify shape is 4.4 GB (loads on 8 GB); the fp16 equivalent is 8 GB and does not.
 - **One request, no batching**; no left-padded prompts.
 - **Prefill models load lazily**, decode models at startup; a full bundle stores both shapes.
 - **Not implemented:** tools/structured output, `logit_bias`, `n`, `logprobs`; `stop` strings apply

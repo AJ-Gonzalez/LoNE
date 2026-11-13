@@ -84,6 +84,18 @@ def _short_name(hf_suffix: str, spec: ModelSpec) -> str | None:
     return None
 
 
+def _normalize_conv(kernel):
+    """Depthwise conv kernel as (C, 1, K), from either HF's (C, 1, K) or MLX's (C, K, 1).
+
+    `mlx_lm.fuse` writes the fused checkpoint in MLX's parameter layout: the conv weight keeps
+    MLX's (out, kernel, 1) order under HF's tensor name. Same taps, same order, so the fix is a
+    transpose of the two unit axes — but skipping it makes the conv silently read the wrong filter.
+    """
+    if kernel.dim() == 3 and kernel.shape[1] != 1 and kernel.shape[2] == 1:
+        return kernel.transpose(1, 2).contiguous()
+    return kernel
+
+
 def _read_layer(sd, spec: ModelSpec, layer: int, dtype) -> dict:
     prefix = f"model.layers.{layer}."
     params = {}
@@ -92,7 +104,8 @@ def _read_layer(sd, spec: ModelSpec, layer: int, dtype) -> dict:
             continue
         short = _short_name(key[len(prefix) :], spec)
         if short is not None:
-            params[short] = sd.get_tensor(key).to(dtype)
+            tensor = sd.get_tensor(key).to(dtype)
+            params[short] = _normalize_conv(tensor) if short == "conv" else tensor
     if spec.is_attention(layer):
         need = {"q_proj", "k_proj", "v_proj", "o_proj", spec.qk_norm_prefix}
         if spec.attention_gate:
@@ -193,6 +206,7 @@ def convert_model(
     ring: bool = True,
     decode_only: bool = False,
     prefill_only: bool = False,
+    spec_drafts: int = 0,
     check_plan: bool = True,
     compute_units: str = "cpu_and_ne",
     log=print,
@@ -219,6 +233,13 @@ def convert_model(
 
     if decode_only and prefill_only:
         raise ValueError("--decode-only and --prefill-only are mutually exclusive")
+    if spec_drafts:
+        if spec_drafts < 1:
+            raise ValueError("--spec-drafts must be >= 1")
+        if decode_only:
+            raise ValueError("--spec-drafts needs the prefill models it verifies with; drop --decode-only")
+        # One extra position: speculative verification feeds the pending token plus the drafts.
+        prefill = spec_drafts + 1
     if prefill_only:
         seqs = [("prefill", prefill)]
     elif decode_only:
@@ -235,12 +256,12 @@ def convert_model(
             entries = {"name": f"chunk_{gi}", "layers": layer_ids, "models": {}}
 
             for tag, seq in seqs:
-                module = Chunk(spec, params, layer_ids, seq, ctx, ring)
+                module = Chunk(spec, params, layer_ids, seq, ctx, ring, trace_conv=seq > 1)
                 example = example_inputs(spec, layout, seq, ctx, ring=ring)
                 name = f"chunk_{gi}_{tag}"
-                path = _trace_and_convert(module, layout["inputs"], layout["outputs"], example, name,
-                                          chunk_dir, precision)
-                entry = {"file": f"chunks/{name}.mlpackage", "seq": seq}
+                path = _trace_and_convert(module, module.input_names, module.output_names, example,
+                                          name, chunk_dir, precision)
+                entry = {"file": f"chunks/{name}.mlpackage", "seq": seq, "trace_conv": seq > 1}
                 if check_plan:
                     entry["plan"] = plan_summary(path, compute_units)
                     log(f"  {name}: {entry['plan'].get('devices', entry['plan'])}")
@@ -257,11 +278,14 @@ def convert_model(
         vocab = spec.vocab_size
         head_chunks = max(1, head_chunks or head_chunk_count(vocab, spec.hidden_size, precision))
         step = math.ceil(vocab / head_chunks)
+        # Speculative decoding needs one logits row per verified position, so the head is traced at
+        # the verify length; the decode path pads a single hidden row up to it.
+        head_seq = prefill if spec_drafts else 1
         head_meta = []
         for j, start in enumerate(range(0, vocab, step)):
             end = min(start + step, vocab)
             module = Head(spec, embed, norm, start, end)
-            example = {"hidden": torch.zeros(1, 1, spec.hidden_size, dtype=torch.float16)}
+            example = {"hidden": torch.zeros(1, head_seq, spec.hidden_size, dtype=torch.float16)}
             name = f"head_{j}"
             path = _trace_and_convert(module, ["hidden"], ["logits"], example, name, head_dir, precision)
             entry = {"file": f"head/{name}.mlpackage", "start": start, "end": end}
@@ -284,9 +308,10 @@ def convert_model(
         "ring": ring,
         "precision": precision,
         "chunks": chunks_meta,
-        "head": {"chunks": head_meta, "vocab": vocab},
+        "head": {"chunks": head_meta, "vocab": vocab, "seq": head_seq},
         "embedding": {"file": "embedding.fp16.npy", "vocab": vocab, "hidden": spec.hidden_size},
         "tokenizer": {"dir": "tokenizer"},
+        "speculative": {"drafts": spec_drafts} if spec_drafts else {},
         "seconds": round(time.time() - started, 1),
     }
     with open(os.path.join(out_dir, "manifest.json"), "w") as f:

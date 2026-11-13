@@ -14,8 +14,13 @@ def is_attention(kind: str) -> bool:
     return kind in ATTENTION_KINDS
 
 
-def chunk_layout(spec: ModelSpec, layer_ids: list[int]) -> dict:
-    """Input/output names for one chunk, in trace order."""
+def chunk_layout(spec: ModelSpec, layer_ids: list[int], trace_conv: bool = False) -> dict:
+    """Input/output names for one chunk, in trace order.
+
+    `trace_conv` adds one extra output per conv layer: the conv window plus this pass's inputs.
+    A multi-token pass can then be cut at any prefix — the runtime needs that when speculative
+    verification accepts only part of the tokens it fed.
+    """
     attn = [i for i in layer_ids if spec.is_attention(i)]
     conv = [i for i in layer_ids if not spec.is_attention(i)]
     kinds = [k for k in ATTENTION_KINDS if any(spec.kind(i) == k for i in attn)]
@@ -34,12 +39,15 @@ def chunk_layout(spec: ModelSpec, layer_ids: list[int]) -> dict:
         outputs += [f"k_{i}_out", f"v_{i}_out"]
     for i in conv:
         outputs += [f"conv_{i}_out"]
+    if trace_conv:
+        outputs += [f"conv_{i}_window" for i in conv]
 
     return {
         "layers": list(layer_ids),
         "attention_layers": attn,
         "conv_layers": conv,
         "attention_kinds": kinds,
+        "trace_conv": trace_conv,
         "inputs": inputs,
         "outputs": outputs,
     }

@@ -12,6 +12,7 @@ from jinja2.ext import Extension
 
 from .config import ModelSpec
 from .layout import attention_mask, cache_lengths, chunk_layout, cos_sin
+from .spec import NgramProposer, distribution, speculative_generate
 
 _COMPUTE_UNITS = {
     "cpu_and_ne": "CPU_AND_NE",
@@ -182,9 +183,16 @@ class LoneModel:
         self._tok = BundleTokenizer(os.path.join(bundle_dir, self.manifest["tokenizer"]["dir"]))
 
         self._ring = bool(self.manifest.get("ring", False))
+        # Logits rows one head call produces: 1 unless the bundle was converted for speculation.
+        self.head_seq = int(self.manifest.get("head", {}).get("seq", 1))
+        self.spec_drafts = min(int(self.manifest.get("speculative", {}).get("drafts", 0)),
+                               self.prefill_len - 1)
+        self.spec_stats: dict = {}
         self._cache_len = cache_lengths(self.spec, self.ctx, self._ring)
         self._inv = {kind: _inv_freq(self.spec, kind) for kind in self.spec.rope}
         self._cache_dtype = np.float16
+        self._conv_window: dict[int, np.ndarray] = {}
+        self._pass_start = 0
         self._wire_caches = bool(wire_caches)
         self.wired_bytes = 0
         self._wired: list[tuple[int, int]] = []
@@ -223,6 +231,7 @@ class LoneModel:
             }
         for arr in self._cache_arrays():
             arr.fill(0)
+        self._tokens: list[int] = []
         if allocating and self._wire_caches:
             for arr in self._cache_arrays():
                 span = _wire_pages(arr)
@@ -271,6 +280,9 @@ class LoneModel:
             # In place: the conv window keeps its address, so it stays wired and does not
             # allocate once per token.
             self._conv[i][...] = out[f"conv_{i}_out"]
+            window = out.get(f"conv_{i}_window")
+            if window is not None:
+                self._conv_window[i] = window
         self._hidden = out["hidden_out"].astype(np.float16)
 
     @staticmethod
@@ -300,17 +312,62 @@ class LoneModel:
             if capture is not None:
                 capture.append(hidden[0].copy())
         self.pos = pos + seq
+        self._tokens.extend(ids)
+
+    def _logits_all(self, hidden: np.ndarray) -> np.ndarray:
+        """Logits for the rows of `hidden`, one row per position, as (rows, vocab)."""
+        rows = hidden.shape[1]
+        if rows < self.head_seq:
+            # The head is a static shape; rows are independent, so a repeat is free of meaning.
+            hidden = np.repeat(hidden[:, -1:, :], self.head_seq, axis=1)
+        parts = [
+            model.predict({"hidden": hidden})["logits"].astype(np.float32)
+            for model, _ in zip(self._heads, self._head_ranges)
+        ]
+        return np.concatenate(parts, axis=-1)[0, -rows:]
 
     def _logits(self) -> np.ndarray:
-        parts = []
-        for model, (start, end) in zip(self._heads, self._head_ranges):
-            parts.append(model.predict({"hidden": self._hidden[:, -1:, :]})["logits"].astype(np.float32))
-        return np.concatenate(parts, axis=-1)[0, 0]
+        return self._logits_all(self._hidden)[-1]
 
     def unload_prefill(self) -> None:
         """Drop lazily loaded prefill models (they reload on the next prefill)."""
         for chunk in self._chunks:
             chunk["models"].pop("prefill", None)
+
+    # ----------------------------------------------------------------- verify
+    def verify(self, ids: list[int]) -> np.ndarray:
+        """Feed `ids` as one multi-token pass; return one logits row per position.
+
+        The pass runs at the bundle's fixed prefill shape, so the tail is padded with repeats of
+        the last token and stays uncommitted until `commit` says which prefix survived. Attention
+        caches are written at absolute positions and the mask only admits rows below `pos`, so the
+        discarded rows are overwritten by the next pass; conv windows are rewound from the window
+        the graph returns.
+        """
+        if not ids:
+            raise LoneError("empty verify pass")
+        if len(ids) > self.prefill_len:
+            raise LoneError(
+                f"verify pass of {len(ids)} tokens exceeds the bundle's prefill shape "
+                f"{self.prefill_len}; reconvert with a larger --spec-drafts"
+            )
+        if any("prefill" not in chunk["paths"] for chunk in self._chunks):
+            raise LoneError("bundle has no prefill models; reconvert without --decode-only")
+        if self.pos + self.prefill_len > self.ctx:
+            raise LoneError("context exhausted")
+        self._pass_start = self.pos
+        pad = list(ids) + [ids[-1]] * (self.prefill_len - len(ids))
+        self._forward(pad, "prefill")
+        return self._logits_all(self._hidden)[: len(ids)]
+
+    def commit(self, n: int) -> None:
+        """Keep the first `n` tokens of the last verify pass and discard the rest."""
+        keep = self._pass_start + n
+        del self._tokens[keep:]
+        self.pos = keep
+        width = self.spec.conv_kernel - 1
+        for i, window in self._conv_window.items():
+            self._conv[i][...] = window[:, :, n : n + width]
 
     # --------------------------------------------------------------- generate
     def feed(self, ids: list[int]) -> None:
@@ -344,9 +401,12 @@ class LoneModel:
         stop_ids: list[int] | None = None,
         seed: int | None = None,
         on_token=None,
+        proposer: NgramProposer | None = None,
+        max_drafts: int = 0,
     ) -> list[int]:
         self.prefill(prompt_ids)
-        return self.generate_next(max_new_tokens, temperature, top_p, top_k, stop_ids, seed, on_token)
+        return self.generate_next(max_new_tokens, temperature, top_p, top_k, stop_ids, seed, on_token,
+                                  proposer=proposer, max_drafts=max_drafts)
 
     def generate_next(
         self,
@@ -357,11 +417,16 @@ class LoneModel:
         stop_ids: list[int] | None = None,
         seed: int | None = None,
         on_token=None,
+        proposer: NgramProposer | None = None,
+        max_drafts: int = 0,
     ) -> list[int]:
         """Sample from the current state; `feed` must have been called first."""
         logits = self._logits()
         stop = set(stop_ids or self.spec.eos_token_ids)
         rng = np.random.default_rng(seed)
+        if proposer is not None:
+            return self._generate_spec(logits, max_new_tokens, temperature, top_p, top_k, stop, rng,
+                                       on_token, proposer, max_drafts or self.spec_drafts)
         out: list[int] = []
         for _ in range(max_new_tokens):
             if self.pos >= self.ctx:
@@ -377,71 +442,39 @@ class LoneModel:
             logits = self.step(token)
         return out
 
-
-# Ranks past this can only be sampled when the distribution is flat enough that top-p keeps most
-# of the vocabulary; the prefilter detects that and falls back to the full vector.
-_SAMPLE_CANDIDATES = 1024
+    def _generate_spec(self, logits, max_new_tokens, temperature, top_p, top_k, stop, rng,
+                       on_token, proposer: NgramProposer, max_drafts: int) -> list[int]:
+        max_drafts = min(max_drafts or self.spec_drafts, self.prefill_len - 1)
+        if max_drafts < 1:
+            raise LoneError("this bundle has no verify shape; convert with --spec-drafts")
+        history = self._tokens
+        self.spec_stats = {}
+        return speculative_generate(
+            verify=self.verify,
+            commit=self.commit,
+            propose=lambda sampled: proposer.propose(history, sampled),
+            first_logits=logits,
+            max_new_tokens=max_new_tokens,
+            room=lambda: self.ctx - self.pos,
+            max_drafts=max_drafts,
+            pass_len=self.prefill_len,
+            step=self.step,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            stop=stop,
+            rng=rng,
+            on_token=on_token,
+            stats=self.spec_stats,
+        )
 
 
 def sample(logits: np.ndarray, temperature: float = 0.0, top_p: float = 1.0, top_k: int = 0,
            rng: np.random.Generator | None = None) -> int:
-    """Draw one token. Greedy at temperature 0; otherwise softmax over the sampled support.
-
-    Sorting the whole vocabulary per token cost 9 ms at 128k, but only the head of the
-    distribution can ever be drawn: `top_k` is a hard cut and `top_p < 1` keeps a few hundred
-    ranks in practice. The support is found by `argpartition` and only that slice is sorted. The
-    probabilities passed to `rng.choice` are the true ones (divided by the full-vocabulary mass),
-    so the kept set matches the vocabulary-wide computation; when top-p would reach beyond the
-    slice, the full vector is used instead.
-    """
+    """Draw one token. Greedy at temperature 0; otherwise `spec.distribution` then one draw."""
     if temperature <= 0:
         return int(np.argmax(logits))
     if rng is None:
         rng = np.random.default_rng()
-
-    x = logits / np.float32(temperature)
-    size = x.size
-
-    if top_k and top_k < size:
-        # Keep every token tied at the cut, as a vocabulary-wide mask does.
-        cut = np.partition(x, -top_k)[-top_k]
-        cand = np.flatnonzero(x >= cut)
-        order = np.argsort(-x[cand])
-        kept, probs = _top_p(_softmax(x[cand][order].astype(np.float64)), top_p)
-        return int(rng.choice(cand[order[kept]], p=probs))
-
-    if top_p < 1.0 and size > _SAMPLE_CANDIDATES:
-        e = np.exp(x.astype(np.float64) - float(x.max()))
-        total = e.sum()
-        cand = np.argpartition(e, -_SAMPLE_CANDIDATES)[-_SAMPLE_CANDIDATES:]
-        probs = e[cand] / total
-        order = np.argsort(-probs)
-        kept, normalised = _top_p(probs[order], top_p)
-        if kept.size < order.size:
-            return int(rng.choice(cand[order[kept]], p=normalised))
-        # Top-p needs ranks outside the slice: the full distribution is already exponentiated.
-        probs = e / total
-    else:
-        probs = _softmax(x.astype(np.float64))
-
-    if top_p >= 1.0:
-        return int(rng.choice(size, p=probs))
-    order = np.argsort(-probs)
-    kept, normalised = _top_p(probs[order], top_p)
-    return int(rng.choice(order[kept], p=normalised))
-
-
-def _top_p(sorted_probs: np.ndarray, top_p: float) -> tuple[np.ndarray, np.ndarray]:
-    """Indices and renormalised probabilities of the top-p set of `sorted_probs` (descending)."""
-    if top_p >= 1.0:
-        return np.arange(sorted_probs.size), sorted_probs
-    keep = np.cumsum(sorted_probs) <= top_p
-    keep[0] = True
-    probs = sorted_probs[keep]
-    return np.flatnonzero(keep), probs / probs.sum()
-
-
-def _softmax(x: np.ndarray) -> np.ndarray:
-    x = x - np.max(x)
-    e = np.exp(x)
-    return e / e.sum()
+    ids, probs = distribution(logits / np.float32(temperature), top_p, top_k)
+    return int(rng.choice(ids, p=probs))
