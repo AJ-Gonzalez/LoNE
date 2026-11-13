@@ -104,6 +104,12 @@ for it and a rejected position draws from the target minus that token, so `--tem
 decode produces, except where the two graph shapes disagree on a near-tie: measured 0.9999 logits
 cosine between them, 96/96 identical tokens on a 230M copy test, 124/128 (96.9%) on the LUT8 1.7B.
 
+Quality is unchanged: speculation only changes which graph shape computes the logits, and the
+accept rule is exact rejection sampling, so sampled output keeps the target distribution. Greedy,
+128 new tokens, LUT8 coder on the NE, both arms on the same prompt: **identical** on a chat copy
+request, a code task and prose; 124/128 on the repeated-text workload, where the one divergence sits
+on a 0.09-logit top-2 margin (a tie in fp16) and everything after it differs.
+
 Measured (this M1, one process, both arms interleaved after a warmup; rates exclude prefill):
 
 | Bundle, engine | Workload | No spec | Spec | Acceptance | Tokens/pass |
