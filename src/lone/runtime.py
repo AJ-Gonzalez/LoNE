@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import shutil
 import sys
 
 import jinja2
@@ -165,7 +167,15 @@ class LoneModel:
 
         units = getattr(ct.ComputeUnit, _COMPUTE_UNITS[compute_units])
         self._units = units
-        load = lambda path: ct.models.MLModel(path, compute_units=units)
+        self._compiled: list[str] = []
+        atexit.register(self._cleanup_compiled)
+
+        def load(path):
+            model = ct.models.MLModel(path, compute_units=units)
+            # Core ML compiles every mlpackage into `$TMPDIR/<name>_<uuid>.mlmodelc` and never
+            # collects it: ~465 MB per chunk graph, ~7 GB per process for a two-shape 1.7B bundle.
+            self._compiled.append(model.get_compiled_model_path())
+            return model
 
         self._chunks = []
         for entry in self.manifest["chunks"]:
@@ -328,6 +338,12 @@ class LoneModel:
 
     def _logits(self) -> np.ndarray:
         return self._logits_all(self._hidden)[-1]
+
+    def _cleanup_compiled(self) -> None:
+        """Remove the compiled graph copies Core ML leaves in `$TMPDIR` (atexit)."""
+        for path in self._compiled:
+            shutil.rmtree(path, ignore_errors=True)
+        self._compiled.clear()
 
     def unload_prefill(self) -> None:
         """Drop lazily loaded prefill models (they reload on the next prefill)."""
