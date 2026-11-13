@@ -171,11 +171,7 @@ class LoneModel:
         atexit.register(self._cleanup_compiled)
 
         def load(path):
-            model = ct.models.MLModel(path, compute_units=units)
-            # Core ML compiles every mlpackage into `$TMPDIR/<name>_<uuid>.mlmodelc` and never
-            # collects it: ~465 MB per chunk graph, ~7 GB per process for a two-shape 1.7B bundle.
-            self._compiled.append(model.get_compiled_model_path())
-            return model
+            return self._load_model(path)
 
         self._chunks = []
         for entry in self.manifest["chunks"]:
@@ -265,9 +261,7 @@ class LoneModel:
         layout = chunk["layout"]
         model = chunk["models"].get(tag)
         if model is None:
-            import coremltools as ct
-
-            model = ct.models.MLModel(chunk["paths"][tag], compute_units=self._units)
+            model = self._load_model(chunk["paths"][tag])
             chunk["models"][tag] = model
         seq = hidden.shape[1]
         feed = {"hidden": hidden}
@@ -338,6 +332,19 @@ class LoneModel:
 
     def _logits(self) -> np.ndarray:
         return self._logits_all(self._hidden)[-1]
+
+    def _load_model(self, path: str):
+        """Load one mlpackage, tracking the compiled copy Core ML leaves in `$TMPDIR`.
+
+        Every load compiles into `$TMPDIR/<name>_<uuid>.mlmodelc` and nothing collects it: ~465 MB
+        per chunk graph, ~7 GB per process for a two-shape 1.7B bundle. Both the eager decode load
+        and the lazy prefill load go through here.
+        """
+        import coremltools as ct
+
+        model = ct.models.MLModel(path, compute_units=self._units)
+        self._compiled.append(model.get_compiled_model_path())
+        return model
 
     def _cleanup_compiled(self) -> None:
         """Remove the compiled graph copies Core ML leaves in `$TMPDIR` (atexit)."""
