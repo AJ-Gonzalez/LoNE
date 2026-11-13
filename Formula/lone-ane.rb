@@ -3,10 +3,10 @@ class LoneAne < Formula
 
   desc "Run LFM3 and LFM2.5 on the Apple Neural Engine"
   homepage "https://github.com/AJ-Gonzalez/LoNE"
-  url "https://github.com/AJ-Gonzalez/LoNE/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "9ee127fcc157ee4c34ea07af1b6f638d8bbb6b4e38d963ee37aad72c922d9a5b"
+  url "https://github.com/AJ-Gonzalez/LoNE/archive/refs/tags/v0.1.1.tar.gz"
+  sha256 "68381cb033072e376c56b80a23384a57cc7b78280fe77aac6698cec54cff7fc0"
   license "Apache-2.0"
-  version "0.1.0"
+  version "0.1.1"
 
   depends_on "python@3.12"
   depends_on :macos => :sequoia
