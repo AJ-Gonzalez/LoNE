@@ -154,6 +154,9 @@ def _inv_freq(spec: ModelSpec, kind: str) -> np.ndarray:
 
 class LoneModel:
     def __init__(self, bundle_dir: str, compute_units: str = "cpu_and_ne", wire_caches: bool = False):
+        if sys.platform != "darwin":
+            raise LoneError("lone targets the Apple Neural Engine and needs macOS; "
+                            f"this is {sys.platform}")
         import coremltools as ct
 
         self.dir = bundle_dir

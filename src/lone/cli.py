@@ -218,6 +218,9 @@ register_verify(app)
 
 
 def main() -> None:
+    if sys.platform != "darwin":
+        print(f"lone needs macOS (Apple Neural Engine); this is {sys.platform}.", file=sys.stderr)
+        raise typer.Exit(1)
     app()
 
 
