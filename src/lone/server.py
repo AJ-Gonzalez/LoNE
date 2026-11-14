@@ -15,6 +15,7 @@ import threading
 import time
 
 from . import __version__
+from .harness import normalize_tools, parse_tool_calls, split_thinking, turn_stop_ids
 from .metrics import ANECounters
 from .runtime import LoneModel
 
@@ -24,6 +25,32 @@ _DONE = ("done",)
 
 def _server_time() -> int:
     return int(time.time())
+
+
+def assistant_message(text: str) -> dict:
+    """An OpenAI assistant message from the generated turn.
+
+    The tag grammar stays the model's: reasoning is split off, both LFM tool-call grammars are
+    parsed, and each call's arguments are the JSON string the OpenAI schema requires.
+    """
+    reasoning, content = split_thinking(text)
+    content, calls = parse_tool_calls(content)
+    message: dict = {"role": "assistant", "content": content}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    if calls:
+        message["tool_calls"] = [
+            {
+                "id": f"call_{index}",
+                "type": "function",
+                "function": {
+                    "name": call["name"],
+                    "arguments": json.dumps(call["arguments"], ensure_ascii=False),
+                },
+            }
+            for index, call in enumerate(calls)
+        ]
+    return message
 
 
 def create_app(bundle_dir: str, compute_units: str = "cpu_and_ne", wire_caches: bool = False):
@@ -219,8 +246,20 @@ def create_app(bundle_dir: str, compute_units: str = "cpu_and_ne", wire_caches: 
     @app.post("/v1/chat/completions")
     async def chat_completions(body: dict):
         messages = body.get("messages") or []
-        prompt_ids = model.tokenizer.chat(messages, add_generation_prompt=True)
+        tools = normalize_tools(body.get("tools") or [])
+        template_kwargs: dict = {}
+        extra = body.get("chat_template_kwargs")
+        if isinstance(extra, dict):
+            template_kwargs.update(extra)
+        if "enable_thinking" in body and "enable_thinking" not in template_kwargs:
+            template_kwargs["enable_thinking"] = bool(body["enable_thinking"])
+        if body.get("tool_choice") is not None:
+            template_kwargs["tool_choice"] = body["tool_choice"]
+        prompt_ids = model.tokenizer.chat(
+            messages, tools=tools or None, add_generation_prompt=True, **template_kwargs
+        )
         params = _params(body)
+        params["stop_ids"] = turn_stop_ids(model)
         streams = bool(body.get("stream"))
         stops = _stop_strings(body)
         created = _server_time()
@@ -230,13 +269,17 @@ def create_app(bundle_dir: str, compute_units: str = "cpu_and_ne", wire_caches: 
                 ids, started, ended, first_at = await asyncio.to_thread(_run, prompt_ids, params)
             text = _apply_stop(model.tokenizer.decode(ids), stops)
             usage = _record(len(prompt_ids), ids, started, first_at, ended)
+            message = (
+                assistant_message(text) if tools
+                else {"role": "assistant", "content": text}
+            )
+            finish = "tool_calls" if message.get("tool_calls") else _finish(ids, params)
             return {
                 "id": f"chatcmpl-{created}",
                 "object": "chat.completion",
                 "created": created,
                 "model": model_name,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                             "finish_reason": _finish(ids, params)}],
+                "choices": [{"index": 0, "message": message, "finish_reason": finish}],
                 "usage": {"prompt_tokens": usage["prompt_tokens"],
                           "completion_tokens": usage["completion_tokens"],
                           "total_tokens": usage["prompt_tokens"] + usage["completion_tokens"]},

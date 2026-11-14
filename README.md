@@ -146,7 +146,7 @@ curl -s localhost:8082/v1/chat/completions -H 'Content-Type: application/json' -
 
 | Endpoint | Notes |
 |---|---|
-| `POST /v1/chat/completions` | OpenAI chat schema, SSE when `stream: true` |
+| `POST /v1/chat/completions` | OpenAI chat schema; `tools` and `tool_choice` render through the bundle's template, and answers carry `reasoning_content` plus `tool_calls` (JSON-string arguments, `finish_reason: "tool_calls"`) on non-streaming requests; SSE when `stream: true` |
 | `POST /v1/completions` | raw prompt, SSE when `stream: true` |
 | `GET /v1/models`, `/health` | harness probes |
 | `GET /metrics` | prefill/decode seconds and rates, last-request ANE bytes (IOReport; streams included) |
@@ -183,7 +183,14 @@ printf '%s' '{"input":[[{"type":"text","text":"Say hi."}]],"tools":[],"resources
 
 The turn needs `prompt + 1` tokens of the bundle's context; `--max-new-tokens` is clamped to what
 is left. `--temperature`, `--top-p`, `--top-k`, `--seed`, `--thinking/--no-thinking`, `--system`
-and the engine flags are the same as `run`. macOS only, like everything else here.
+and the engine flags are the same as `run`.
+
+**`--endpoint` is a thin client.** `--endpoint http://host:8082` (or `…/v1`, or the full
+`/v1/chat/completions` URL) sends the same history and tool definitions to a `lone serve` on the
+network and parses the answer with the same `split_thinking` / `parse_tool_calls` path; nothing is
+loaded locally and Core ML is never imported. `--bundle` and `--endpoint` are mutually exclusive.
+Off macOS, `lone --help`, `lone inspect` and `lone harness --endpoint` run; every command that
+loads a bundle exits 1 with `lone targets the Apple Neural Engine and needs macOS` on stderr.
 
 ## Precision rules
 

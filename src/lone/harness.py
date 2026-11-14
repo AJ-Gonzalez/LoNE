@@ -25,6 +25,8 @@ import json
 import re
 import sys
 import time
+import urllib.error
+import urllib.request
 from typing import Any
 
 ASSISTANT_KINDS = frozenset({
@@ -336,6 +338,47 @@ def chunks(reasoning: str, text: str, calls: list[dict]) -> list[dict]:
     return out
 
 
+_ENDPOINT_TIMEOUT = 600.0
+
+
+def endpoint_url(endpoint: str) -> str:
+    """The chat-completions URL for a `serve` base, a `/v1` prefix, or the full endpoint."""
+    url = endpoint.strip().rstrip("/")
+    if not url.startswith(("http://", "https://")):
+        url = f"http://{url}"
+    if url.endswith("/v1"):
+        return f"{url}/chat/completions"
+    if url.endswith("/v1/chat/completions"):
+        return url
+    return f"{url}/v1/chat/completions"
+
+
+def chunks_from_message(message: dict, thinking: bool = True) -> list[dict]:
+    """The turn's chunks from an OpenAI assistant message.
+
+    A LoNE `serve` splits reasoning and tool calls and returns them structured; any other OpenAI
+    server returns the generated text, which is split and parsed here with the same functions a
+    local bundle turn uses.
+    """
+    reasoning = message.get("reasoning_content") or ""
+    content = message.get("content") or ""
+    if not reasoning:
+        reasoning, content = split_thinking(content) if thinking else ("", content)
+    content, calls = parse_tool_calls(content)
+    structured = message.get("tool_calls")
+    if isinstance(structured, list) and structured:
+        calls = []
+        for call in structured:
+            function = call.get("function") or {}
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                arguments = _arguments(arguments)
+            elif not isinstance(arguments, dict):
+                arguments = {}
+            calls.append({"name": function.get("name", ""), "arguments": arguments})
+    return chunks(reasoning, content, calls)
+
+
 def envelope(turn: list[dict]) -> str:
     """The last stdout line: the turn under `eval`, nothing captured under `stdout`."""
     return json.dumps({"eval": turn, "stdout": ""}, ensure_ascii=False)
@@ -344,8 +387,12 @@ def envelope(turn: list[dict]) -> str:
 # -------------------------------------------------------------------- the turn
 
 
-def _stop_ids(model) -> list[int]:
-    """The bundle's EOS ids plus the template's own end-of-turn token, if it is a token."""
+def turn_stop_ids(model) -> list[int]:
+    """The bundle's EOS ids plus the template's own end-of-turn token, if it is a token.
+
+    A chat turn stops where the chat template ends it; the raw `/v1/completions` path keeps the
+    bundle's EOS set only.
+    """
     ids = set(model.spec.eos_token_ids or ())
     for marker in ("<|im_end|>", "</s>"):
         encoded = model.tokenizer.encode(marker, add_special_tokens=False)
@@ -398,7 +445,7 @@ def run(
         top_p=top_p,
         top_k=top_k,
         seed=seed,
-        stop_ids=_stop_ids(model),
+        stop_ids=turn_stop_ids(model),
     )
     elapsed = time.perf_counter() - started
     text = model.tokenizer.decode(ids, skip_special_tokens=True)
@@ -409,6 +456,72 @@ def run(
     print(
         f"[harness: {len(prompt_ids)} prompt + {len(ids)} new tokens in {elapsed:.2f} s "
         f"| {len(turn)} chunks]",
+        file=sys.stderr,
+    )
+    return turn
+
+
+def run_endpoint(
+    feed: dict,
+    endpoint: str,
+    system: str | None = None,
+    max_new_tokens: int = 512,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
+    seed: int | None = None,
+    thinking: bool = True,
+) -> list[dict]:
+    """One turn on a `lone serve` endpoint: the same feed and chunks, no model in this process.
+
+    The history and the tool definitions go over the wire; the server renders them through the
+    bundle's chat template and returns the generated turn. Nothing here imports Core ML.
+    """
+    messages = history_to_messages(feed["input"])
+    if system:
+        messages.insert(0, {"role": "system", "content": system})
+    tools = normalize_tools(feed["tools"])
+    payload: dict[str, Any] = {
+        "messages": messages,
+        "max_tokens": max_new_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": thinking},
+    }
+    if tools:
+        payload["tools"] = tools
+    if seed is not None:
+        payload["seed"] = seed
+
+    url = endpoint_url(endpoint)
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    started = time.perf_counter()
+    try:
+        with urllib.request.urlopen(request, timeout=_ENDPOINT_TIMEOUT) as response:
+            body = response.read()
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace").strip()
+        raise HarnessError(f"{url} returned HTTP {error.code}: {detail}") from None
+    except (urllib.error.URLError, OSError) as error:
+        raise HarnessError(f"cannot reach {url}: {error}") from None
+
+    try:
+        message = json.loads(body)["choices"][0]["message"]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
+        raise HarnessError(f"{url} did not answer with an OpenAI chat completion: {error}") from None
+    if not isinstance(message, dict):
+        raise HarnessError(f"{url} answered without an assistant message")
+
+    turn = chunks_from_message(message, thinking=thinking)
+    print(
+        f"[harness: endpoint turn, {len(turn)} chunks in {time.perf_counter() - started:.2f} s]",
         file=sys.stderr,
     )
     return turn

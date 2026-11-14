@@ -7,7 +7,19 @@
   line of stdout (`{"eval": <chunks>, "stdout": ""}`). The stored history is rendered through the
   bundle's chat template — tool calls coalesced by id, tool responses as `tool` messages — and the
   generated turn is split into reasoning, text and tool calls. Both LFM tool-call grammars are
-  parsed back. macOS-only, like the rest of LoNE.
+  parsed back. `--bundle` needs macOS, like the rest of LoNE.
+- **`lone harness --endpoint`.** A thin client for a `lone serve` on the LAN: the same feed goes
+  to `/v1/chat/completions` and the answer is parsed with the same split/parse path, so a Linux
+  container with no Core ML runs the turn against a LoNE host. `--bundle` and `--endpoint` are
+  mutually exclusive; `--bundle` is unchanged.
+- **`lone serve` speaks tools.** `/v1/chat/completions` accepts the OpenAI `tools` and
+  `tool_choice` fields, renders them through the bundle's chat template, and returns
+  `reasoning_content` plus `tool_calls` (JSON-string arguments) with
+  `finish_reason: "tool_calls"`. Chat generation stops at the template's end-of-turn token, not
+  only the bundle's EOS set.
+- **Off macOS, only Core ML is refused.** `lone --help`, `lone inspect` and `lone harness
+  --endpoint` run; a command that needs a bundle exits 1 with the reason on stderr and no
+  traceback (it used to raise `typer.Exit` outside Click).
 
 ## 0.1.1
 
