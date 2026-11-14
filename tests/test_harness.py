@@ -16,11 +16,13 @@ import pytest
 from lone.harness import (
     HarnessError,
     chunks,
+    endpoint_url,
     envelope,
     history_to_messages,
     load_feed,
     normalize_tools,
     parse_tool_calls,
+    run_endpoint,
     split_thinking,
 )
 
@@ -185,3 +187,69 @@ def test_one_turn_on_a_bundle_answers_in_chunks():
         assert chunk["type"] in {
             "assistant_reasoning", "assistant_text_content", "assistant_tool_call",
         }
+
+
+def test_endpoint_url_takes_a_base_prefix_or_full_endpoint():
+    assert endpoint_url("127.0.0.1:8082") == "http://127.0.0.1:8082/v1/chat/completions"
+    assert endpoint_url("http://host:8082/") == "http://host:8082/v1/chat/completions"
+    assert endpoint_url("http://host:8082/v1") == "http://host:8082/v1/chat/completions"
+    assert (
+        endpoint_url("http://host:8082/v1/chat/completions")
+        == "http://host:8082/v1/chat/completions"
+    )
+
+
+def test_endpoint_turn_matches_the_local_parsing_path(canned_server):
+    text = (
+        ">\nweigh it\n</think\nreading\n"
+        "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    reasoning, content = split_thinking(text)
+    content, calls = parse_tool_calls(content)
+    canned_server.payload = {"choices": [{
+        "message": {
+            "role": "assistant",
+            "content": "reading",
+            "reasoning_content": "weigh it",
+            "tool_calls": [{
+                "id": "call_0",
+                "type": "function",
+                "function": {"name": "read", "arguments": '{"path": "a.txt"}'},
+            }],
+        },
+        "finish_reason": "tool_calls",
+    }]}
+    feed = load_feed(json.dumps({
+        "input": [[{"type": "text", "text": "read a.txt"}]],
+        "tools": [{"name": "read", "inputSchema": {"type": "object"}}],
+        "resources": [],
+    }))
+    turn = run_endpoint(feed, canned_server.url)
+    assert turn == chunks(reasoning, content, calls)
+    request = canned_server.requests[0]
+    assert request["path"] == "/v1/chat/completions"
+    assert request["body"]["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": "read a.txt"}]}
+    ]
+    assert request["body"]["tools"][0]["function"]["name"] == "read"
+    assert request["body"]["chat_template_kwargs"] == {"enable_thinking": True}
+
+
+def test_endpoint_parses_a_plain_text_answer(canned_server):
+    canned_server.payload = {"choices": [{"message": {
+        "role": "assistant",
+        "content": ">\nwhy\n</think\n<|tool_call_start|>[ls()]<|tool_call_end|>",
+    }}]}
+    feed = load_feed('{"input": [[{"type": "text", "text": "list"}]]}')
+    assert run_endpoint(feed, canned_server.url) == chunks(
+        "why", "", [{"name": "ls", "arguments": {}}]
+    )
+
+
+def test_endpoint_failure_is_the_turn_raising(canned_server):
+    canned_server.status = 500
+    canned_server.payload = {"detail": "no model"}
+    feed = load_feed('{"input": [[{"type": "text", "text": "hi"}]]}')
+    with pytest.raises(HarnessError, match="HTTP 500"):
+        run_endpoint(feed, canned_server.url)

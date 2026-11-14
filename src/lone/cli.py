@@ -167,7 +167,13 @@ def run(
 
 @app.command(help="one turn of a Diverge agentic loop, fed on stdin")
 def harness(
-    bundle: str = typer.Option(..., "--bundle"),
+    bundle: str | None = typer.Option(
+        None, "--bundle", help="a converted bundle on this Mac"
+    ),
+    endpoint: str | None = typer.Option(
+        None, "--endpoint",
+        help="a LoNE `serve` base URL instead of a bundle; needs no Core ML and runs off macOS",
+    ),
     system: str | None = typer.Option(None, "--system"),
     max_new_tokens: int = typer.Option(512, "--max-new-tokens"),
     temperature: float = typer.Option(0.0, "--temperature"),
@@ -181,22 +187,41 @@ def harness(
         False, "--wire-caches", help="wire the KV and conv caches with mlock so they cannot be paged out (macOS)"
     ),
 ) -> None:
-    from .harness import envelope, load_feed, run
+    from .harness import envelope, load_feed, run, run_endpoint
 
+    if bundle is not None and endpoint is not None:
+        raise typer.BadParameter(
+            "--bundle and --endpoint are mutually exclusive", param_hint="--endpoint"
+        )
+    if bundle is None and endpoint is None:
+        raise typer.BadParameter("give --bundle or --endpoint", param_hint="--bundle")
     feed = load_feed(sys.stdin.read())
-    turn = run(
-        feed,
-        bundle,
-        system=system,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        seed=seed,
-        thinking=thinking,
-        compute_units=_units(cpu_only, compute_units),
-        wire_caches=wire_caches,
-    )
+    if endpoint is not None:
+        turn = run_endpoint(
+            feed,
+            endpoint,
+            system=system,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+            thinking=thinking,
+        )
+    else:
+        turn = run(
+            feed,
+            bundle,
+            system=system,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+            thinking=thinking,
+            compute_units=_units(cpu_only, compute_units),
+            wire_caches=wire_caches,
+        )
     sys.stdout.write(envelope(turn) + "\n")
     sys.stdout.flush()
     os._exit(0)
@@ -254,10 +279,31 @@ register_chat(app)
 register_verify(app)
 
 
+_COREML_FREE_COMMANDS = frozenset({"inspect"})
+
+
+def _needs_coreml(argv: list[str]) -> bool:
+    """Whether this invocation loads a Core ML model (or converts one).
+
+    Help never does, `inspect` only reads `manifest.json`, and `harness --endpoint` is an HTTP
+    client, so those run off macOS — where the image installs `lone` without `coremltools`.
+    """
+    if not argv or any(arg in ("-h", "--help") for arg in argv):
+        return False
+    command = next((arg for arg in argv if not arg.startswith("-")), None)
+    if command in _COREML_FREE_COMMANDS:
+        return False
+    endpoint = any(arg == "--endpoint" or arg.startswith("--endpoint=") for arg in argv)
+    return not (command == "harness" and endpoint)
+
+
 def main() -> None:
-    if sys.platform != "darwin":
-        print(f"lone needs macOS (Apple Neural Engine); this is {sys.platform}.", file=sys.stderr)
-        raise typer.Exit(1)
+    if sys.platform != "darwin" and _needs_coreml(sys.argv[1:]):
+        print(
+            f"lone targets the Apple Neural Engine and needs macOS; this is {sys.platform}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     app()
 
 
