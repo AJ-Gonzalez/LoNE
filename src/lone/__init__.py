@@ -1,5 +1,5 @@
 """LoNE — LFM models on the Apple Neural Engine."""
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 MANIFEST_FORMAT = "lone-1"

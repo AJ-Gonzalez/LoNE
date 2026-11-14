@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - **`lone harness`.** One turn of a [Diverge](https://github.com/divergenetwork/Diverge)
   agentic loop: one JSON feed on stdin (`input`, `tools`, `resources`), one envelope on the last
