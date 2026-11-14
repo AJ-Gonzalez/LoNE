@@ -32,7 +32,7 @@ brew trust aj-gonzalez/lone
 brew install lone-ane
 ```
 
-Builds the released source tag (`v0.1.1`) into an isolated Python 3.12 venv with runtime
+Builds the released source tag (`v0.2.0`) into an isolated Python 3.12 venv with runtime
 dependencies from PyPI. Conversion extras are opt-in:
 
 ```bash
