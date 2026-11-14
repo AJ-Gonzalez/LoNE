@@ -211,54 +211,34 @@ Chunk size is not a precision knob once those rules are in place: 230M measures 
 readings predate the scaled reductions and exact SiLU. Fewer graphs are also cheaper — each pays a
 start-up ramp — worth 1.58× on 230M (17.6 → 11.1 ms/token) and inside noise on LFM3.
 
-## Measured (M1, 8 GB)
+## Benchmarks
 
-Parity (`lone verify`, decode path):
+Full tables, power, parity and caveats: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
-| Model | Placement | Logits cosine | Notes |
-|---|---|---:|---|
-| LFM2.5-230M (ctx 128) | CPU | 0.99987 | greedy 2 tokens identical, then EOS differs |
-| LFM2.5-350M (ctx 128) | CPU | 0.99989 | greedy 12/12 identical |
-| LFM3-1.7B (ctx 512, 4 layers/graph) | NE | **0.99977** | hidden min 0.99958; argmax match |
+LFM3-1.7B, greedy decode, engine power from IOReport (idle-subtracted). The M4 Pro column is the
+independent run in [issue #1](https://github.com/AJ-Gonzalez/LoNE/issues/1).
 
-Placement is `MLComputePlan` over every chunk. The M1 planner declines the small LFM2.5 graphs, so
-only LFM3 runs on the NE here; those rows are CPU-path parity.
+| Engine | Machine | Prefill tok/s | Decode tok/s | Engine mJ/token |
+|---|---|---:|---:|---:|
+| ANE fp16 | M1 | 50.9 | 8.5 | 70 |
+| ANE LUT8 | M1 | — | 23.1 | — |
+| ANE fp16 | M4 Pro | 1038 | 23.6 | 54 |
+| ANE LUT8 | M4 Pro | 1045 | 25.5 | 59 |
+| MLX 4-bit (GPU) | M1 | 385.9 | 53.3 | 113 |
+| MLX 4-bit (GPU) | M4 Pro | 1261 | 178.5 | 77 |
 
-Speeds and power by engine. Power is the engine's PMP rail, idle-subtracted, via IOReport without
-root; rate and power come from the same window.
+N-gram speculative decoding, both arms interleaved in one process:
 
-| Engine | Weights | Prefill tok/s | Decode tok/s | Prefill power | Decode power | J/token (decode) |
-|---|---|---:|---:|---:|---:|---:|
-| ANE (`CPU_AND_NE`) | fp16, 4.0 GB | 50.9 (32 tok) | 8.5 | 0.25 W | 0.59 W | 0.070 |
-| CPU (`CPU_ONLY`) | fp16, 4.0 GB | 2.73 (32 tok) | 0.20 | 0.45 W | 1.64 W | 8.2 |
-| GPU (MLX 4-bit, Metal) | 4-bit, 0.95 GB | 385.9 (512 tok) | 53.3 | 9.12 W | 6.04 W | 0.113 |
+| Workload | Base tok/s | Spec tok/s | Speedup | Tokens/pass |
+|---|---:|---:|---:|---:|
+| ANE, repeated text (LUT8) | 23.2 | **84.4** | **3.64×** | 5.08 |
+| ANE, chat copy | 19.1 | 23.3 | 1.22× | 1.56 |
+| ANE, novel prose | 22.8 | 24.0 | 1.05× | — |
+| Metal, copy (Q4_K_M) | 37.7 | 66.9 | 1.77× | 2.56 |
 
-![LFM3 throughput: prefill and decode](https://raw.githubusercontent.com/AJ-Gonzalez/LoNE/main/docs/tokens.svg)
-
-![Engine power during decode and prefill](https://raw.githubusercontent.com/AJ-Gonzalez/LoNE/main/docs/power.svg)
-
-Engine numbers, not wall power: decode adds ~1.7 W of CPU orchestration and ~0.9 W of DRAM; the CPU
-row's work power is 2.82 W. The GPU row is 4-bit while ANE/CPU are fp16, so it is not
-quantization-controlled. LFM3 ANE decode varies **2–13 tok/s** with weight residency (8.5 in the
-instrumented window, 13.2 warm, ~2 when 4 GB stream from SSD), so pair rate and power from one run.
-`CPU_AND_GPU` is not a GPU path: 0.51 tok/s at 0.07 W.
-
-Quantized ANE (LFM3-1.7B) — all place every op on the NE; none meets the fp16 parity bar:
-
-| Weights | Bundle | Decode | ANE power | Energy/token | Logits cosine |
-|---|---:|---:|---:|---:|---:|
-| fp16 | 4.0 GB | 13.2 tok/s | 0.59 W | 0.070 J | 0.99977 |
-| LUT8 | 2.2 GB | 23.1 tok/s | — | — | 0.9985 |
-| LUT6 | 1.8 GB | 20.5 tok/s | 0.87 W | 0.039 J | 0.9526 |
-| LUT4 | 1.4 GB | 30.7 tok/s | 0.88 W | 0.037 J | 0.786 |
-
-\* LUT8's parity is from a 57-token code prompt (LUT6 measures 0.9616 there); other rows use an
-earlier, shorter prompt. Power for 8-bit weights is not measured.
-
-Each extra LUT bit buys ~0.04 logits cosine in the 6–8 range; 8-bit is the only format near the
-bar, and 6-bit parity needs QAT. Those power figures are 1–2.5 s window averages; a 60 s sustained
-LUT6 run measured 23.7 tok/s at 1.04 W (43.9 mJ/token) with no throttling, and ~3.7 W system-wide
-with CPU and DRAM. A wall/package figure needs `powermetrics` (root) or a meter.
+Two things to take away: the ANE is the cheapest engine per token but not the cheapest system once
+CPU and DRAM are counted, and speculation is a free option — 3.6× where text repeats, ~1.05×
+otherwise, with greedy output identical except where logits tie.
 
 ## Limits
 
